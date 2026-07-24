@@ -1,0 +1,4 @@
+Sources/Config.local.swift
+build/
+*.xcodeproj
+.DS_Store

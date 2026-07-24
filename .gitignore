@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+data/
+venv/
+.venv/
+.DS_Store
+*.swp

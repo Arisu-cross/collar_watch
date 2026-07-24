@@ -1,0 +1,7 @@
+import Foundation
+
+// 你的上报 token。本文件被 gitignore —— 复制成 Config.local.swift、填真 token
+// (要和服务端的 HEALTH_INGEST_TOKEN 一致)。
+enum ConfigLocal {
+    static let token = "PUT-YOUR-TOKEN-HERE"
+}
