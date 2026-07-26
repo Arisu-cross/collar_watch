@@ -1,5 +1,32 @@
 # health collar
 
+## 2026-07-26 更新：按需实时心率测量
+
+之前的链路都是"手表定时上报、服务器被动收"。这次加了一条反方向的：**AI 侧可以主动调用一个 MCP 工具，手表当场开一段 30 秒的 workout session，测量当下的实时心率并送回来**。全程佩戴者只需要点开Iwatch上的app——app 打开后会自动拉起15s的通知进程，测完手腕轻震一下。
+
+```text
+MCP tool (measure_heart_rate)
+        ↓ 写入 command.json（单槽指令，30 分钟过期）
+你的 ingest endpoint（要新挂两个口，见下）
+        ↑ GET  /command          CollarWatch 轮询领指令
+        ↑ POST /command/result   测完回执统计值
+CollarWatch：HKWorkoutSession 30s 高频采样 → avg/min/max/样本数
+```
+
+**ingest 侧要挂的两个新口**（数据层函数已在 `health_store.py`，HTTP 壳照旧自备）：
+
+- `GET /command` → 执行体 `fetch_pending_command()`。有指令返回 `{"command": "measure_heart_rate", "command_id": "...", "duration_seconds": 30, ...}`，没有返回 `{"command": null}`
+- `POST /command/result` ← 手表送来 `{"command_id": "...", "result": {"heart_rate_average": 83, ...}}`，执行体 `complete_command()`
+
+**手表侧新增**：`CommandFetcher.swift`（领令 / 回执 / 本地防重测记账）、`WorkoutMeasurer.swift`（测量本体，`discardWorkout` 收尾——训练记录不落库、健身三环不受污染，心率样本照常入 HealthKit 由原链路上报）；`Scheduler` / `CollarWatchApp` 接线（前台每 15s 轻轮询 + 测量中界面）。装机后健康授权会多弹一次 workout 写权限，允许即可。
+
+**通知**：因每个人使用的推送方式不同，这里MCP 工具只下指令，没有发送通知的功能（指令下发后等最多 90 秒，没等到返回 pending，结果落 `health_now`）。app 开着会自己拉起进程；如果需要接收通知的话可以在你的 ingest 侧对接自己的推送渠道。
+
+可调参数（环境变量）：`HEALTH_MEASURE_DURATION_S`（测量秒数，默认 30）、`HEALTH_COMMAND_TTL_MIN`（指令有效期，默认 30 分钟）。
+
+> ⚠️ **一个值得单独说的坑**：HealthKit 会在**运行时审查权限描述文案的质量**。`NSHealthUpdateUsageDescription` 写占位敷衍话（比如本项目旧版的"仅测试环境写入模拟数据。"）,请求写权限时会直接抛 `NSInvalidArgumentException` 闪退，报错原话是 `The string "..." is an invalid value for NSHealthUpdateUsageDescription`。这次加了 workout 写权限，并对此进行了相关修正。
+---
+
 `health collar` 是一个面向个人使用的 Apple Health / Apple Watch 数据同步小工具。
 
 它的目标很单纯：让 Apple Watch 上已经写入 HealthKit 的数据，以尽可能短而稳定的延迟同步到你自己的服务器，整理成普通文件，并在需要时通过 MCP 提供给 AI agent 使用（提供summary status和details 两种查看方式）。

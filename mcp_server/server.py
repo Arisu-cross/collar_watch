@@ -58,5 +58,21 @@ async def health_detail(metric: str = "heart_rate",
     return await hs.execute_health_detail(args)
 
 
+@mcp.tool()
+async def measure_heart_rate() -> str:
+    """Ask the watch for a FRESH heart-rate reading right now.
+
+    Drops a command into the file store; the CollarWatch app picks it up
+    (instantly while open — it polls every 15s in the foreground — or on its
+    next background wake) and runs a short workout-session measurement
+    (default 30s, HEALTH_MEASURE_DURATION_S). Waits up to 90 seconds.
+
+    If nobody opens the watch in time, returns status=pending — the command
+    stays valid for 30 minutes and the result lands in health_now once
+    executed. Notifying the wearer is up to your own ingest side; this tool
+    only queues the command."""
+    return await hs.execute_measure_heart_rate()
+
+
 if __name__ == "__main__":
     mcp.run()

@@ -48,7 +48,9 @@ final class HealthCollector {
     }
 
     func requestAuthorization() async throws {
-        try await store.requestAuthorization(toShare: [], read: readTypes)
+        // workout 写权限是 HKLiveWorkoutBuilder.beginCollection 的门票(实时测量用)
+        try await store.requestAuthorization(toShare: [HKObjectType.workoutType()],
+                                             read: readTypes)
     }
 
     // 返回 (新样本, 待提交游标)。游标编码后交 Uploader,200 后 commit。

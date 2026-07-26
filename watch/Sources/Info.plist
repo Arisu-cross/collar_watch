@@ -21,9 +21,13 @@
 	<key>NSHealthShareUsageDescription</key>
 	<string>Collar 读取心率与睡眠,同步到你自己的服务器。</string>
 	<key>NSHealthUpdateUsageDescription</key>
-	<string>仅测试环境写入模拟数据。</string>
+	<string>Collar 在测量心率时需要记录体能训练会话数据。</string>
 	<key>WKApplication</key>
 	<true/>
+	<key>WKBackgroundModes</key>
+	<array>
+		<string>workout-processing</string>
+	</array>
 	<key>WKWatchOnly</key>
 	<true/>
 </dict>

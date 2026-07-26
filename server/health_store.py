@@ -860,3 +860,132 @@ def health_now(hours: float = 6) -> Any:
         except (TypeError, ValueError):
             pass
     return out or "connected, waiting for first samples"
+
+
+# ------------------------------------------------------------
+# 按需实时测量 · 指令通道 (on-demand measurement command channel)
+#   command.json 单槽:MCP 工具下指令 → 手表拉取 → 跑一段短 workout
+#   session 实测 → 回执结果。状态机 pending → seen → done;
+#   超过 TTL 未完成自动 expired。手表侧无指令时零动作。
+# ------------------------------------------------------------
+
+_COMMAND_FILE = _DATA_DIR / "command.json"
+_COMMAND_TTL_MIN = int(os.environ.get("HEALTH_COMMAND_TTL_MIN", "30") or 30)
+_MEASURE_DURATION_S = int(os.environ.get("HEALTH_MEASURE_DURATION_S", "30") or 30)
+
+
+def _write_command(data: dict[str, Any]) -> None:
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(_DATA_DIR), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_json(data))
+        os.replace(tmp, _COMMAND_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_command() -> Optional[dict[str, Any]]:
+    try:
+        return json.loads(_COMMAND_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def create_command(command: str = "measure_heart_rate") -> dict[str, Any]:
+    """下指令。单槽:新指令覆盖旧指令。"""
+    import uuid
+    data = {
+        "command_id": f"cmd_{uuid.uuid4().hex[:12]}",
+        "command": command,
+        "status": "pending",
+        "requested_at": _iso(_now()),
+        "duration_seconds": _MEASURE_DURATION_S,
+        "result": None,
+    }
+    _write_command(data)
+    return data
+
+
+def _expire_if_stale(data: dict[str, Any]) -> dict[str, Any]:
+    if data.get("status") in ("pending", "seen"):
+        ts = _parse_dt(data.get("requested_at"))
+        if ts and (_now() - ts) > timedelta(minutes=_COMMAND_TTL_MIN):
+            data["status"] = "expired"
+            _write_command(data)
+    return data
+
+
+def fetch_pending_command(mark_seen: bool = True) -> Optional[dict[str, Any]]:
+    """手表拉指令(GET /command 的执行体)。pending/seen 且未过期才返回。"""
+    data = _read_command()
+    if not data:
+        return None
+    data = _expire_if_stale(data)
+    if data.get("status") not in ("pending", "seen"):
+        return None
+    if mark_seen and data.get("status") == "pending":
+        data["status"] = "seen"
+        data["seen_at"] = _iso(_now())
+        _write_command(data)
+    return data
+
+
+def complete_command(command_id: str, result: dict[str, Any]) -> bool:
+    """手表回执测量结果(POST /command/result 的执行体)。"""
+    data = _read_command()
+    if not data or data.get("command_id") != command_id:
+        return False
+    data["status"] = "done"
+    data["completed_at"] = _iso(_now())
+    data["result"] = result
+    _write_command(data)
+    return True
+
+
+def get_command_state() -> Optional[dict[str, Any]]:
+    """MCP 工具轮询用。"""
+    data = _read_command()
+    if not data:
+        return None
+    return _expire_if_stale(data)
+
+
+async def execute_measure_heart_rate() -> str:
+    """measure_heart_rate 工具执行体:下指令 → 等手表回执(最多 90 秒)。
+
+    本项目不内置推送:工具只把指令放进 command.json,由 CollarWatch 自己
+    捡走(app 开着时前台每 15s 轮询一次;后台醒来也会顺路查)。想要
+    "叫人来开表"的通知,请在你自己的 ingest 服务里挂,渠道随意。
+    """
+    import asyncio
+    cmd = create_command("measure_heart_rate")
+    for _ in range(45):
+        await asyncio.sleep(2)
+        state = get_command_state()
+        if state and state.get("command_id") == cmd["command_id"] \
+                and state.get("status") == "done":
+            r = state.get("result") or {}
+            done_dt = _parse_dt(state.get("completed_at"))
+            measured_local = (done_dt.astimezone(_TZ).strftime("%Y-%m-%d %H:%M")
+                              + " (server tz)") if done_dt else state.get("completed_at")
+            return _json({
+                "status": "measured",
+                "heart_rate_average": r.get("heart_rate_average"),
+                "heart_rate_minimum": r.get("heart_rate_minimum"),
+                "heart_rate_maximum": r.get("heart_rate_maximum"),
+                "sample_count": r.get("sample_count"),
+                "measured_at": measured_local,
+            })
+    return _json({
+        "status": "pending",
+        "note": ("no result yet - the watch has not executed the command "
+                 "(it polls every 15s while the app is open, or on its next "
+                 "background wake). The command stays valid for "
+                 f"{_COMMAND_TTL_MIN} minutes; once executed the measurement "
+                 "appears in health_now."),
+    })

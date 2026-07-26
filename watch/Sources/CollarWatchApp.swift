@@ -71,6 +71,7 @@ final class Status: ObservableObject {
 
 struct StatusView: View {
     @StateObject private var status = Status.shared
+    @StateObject private var measurer = WorkoutMeasurer.shared
     @State private var busy = false
 
     var body: some View {
@@ -79,6 +80,21 @@ struct StatusView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "heart.circle.fill").foregroundStyle(.pink)
                     Text("Collar").font(.footnote.weight(.semibold))
+                }
+
+                // 服务端下过测量指令时自动进入,佩戴者零操作
+                if measurer.measuring {
+                    VStack(spacing: 2) {
+                        Image(systemName: "heart.fill")
+                            .foregroundStyle(.pink)
+                            .symbolEffect(.pulse)
+                        Text(measurer.currentHeartRate > 0
+                             ? "\(Int(measurer.currentHeartRate)) bpm" : "…")
+                            .font(.title3.weight(.semibold))
+                        Text("测量中 · 还剩 \(measurer.secondsLeft)s")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 2)
                 }
 
                 Group {
@@ -120,6 +136,17 @@ struct StatusView: View {
                     }
                 }
                 .font(.footnote)
+            }
+        }
+        .task {
+            // 前台轻轮询:app 开着时每 15 秒问一次指令。
+            // 没有这个循环,后台任务先把指令标"已见"却不敢开测,
+            // 就得等佩戴者重进 app 才会开始。离屏自动取消。
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                if !WorkoutMeasurer.shared.measuring {
+                    await Scheduler.checkCommand(foreground: true)
+                }
             }
         }
     }
