@@ -782,13 +782,36 @@ def health_now(hours: float = 6) -> Any:
     if not isinstance(h, dict):
         return "connected, waiting for first samples"
 
+    out_head: dict[str, Any] = {}
+    # 应令实测(requested measurement):两小时内完成的 on-demand 测量单独一行,
+    # 放在最新心率之前;与 heart_rate(被动最新值)各自独立。
+    try:
+        _cs = get_command_state()
+        if _cs and _cs.get("status") == "done" and isinstance(_cs.get("result"), dict):
+            _done = _parse_dt(_cs.get("completed_at"))
+            if _done and (_now() - _done) <= timedelta(hours=2):
+                _r = _cs["result"]
+                _mins = int((_now() - _done).total_seconds() // 60)
+                _age = f"{_mins} min ago" if _mins < 60 else f"{_mins // 60} hr {_mins % 60} min ago"
+                _local = _done.astimezone(_TZ).strftime("%H:%M")
+                try:
+                    out_head["requested_measurement"] = (
+                        f"{round(float(_r.get('heart_rate_average')))} bpm average "
+                        f"({round(float(_r.get('heart_rate_minimum')))}-"
+                        f"{round(float(_r.get('heart_rate_maximum')))}), "
+                        f"{_r.get('sample_count')} samples, measured at {_local} ({_age})")
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        logger.warning("health_now: requested_measurement block failed", exc_info=True)
+
     def _n(x):
         try:
             return round(float(x))
         except (TypeError, ValueError):
             return None
 
-    out: dict[str, Any] = {}
+    out: dict[str, Any] = dict(out_head)
     hr = h.get("heart_rate")
     if isinstance(hr, dict) and hr.get("latest") is not None:
         out["heart_rate"] = f"{_n(hr['latest'])} bpm, {_ago(hr.get('age_min'))}"
