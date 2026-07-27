@@ -44,7 +44,7 @@ _STATUS_EXCLUDED_SOURCES = {"filter_test", "drill"}
 # their current calendar-day sum as an additive field.
 _CUMULATIVE_TYPES = {
     "step_count", "flights_climbed", "walking_running_distance",
-    "active_energy_burned", "apple_exercise_time",
+    "active_energy_burned", "apple_exercise_time", "time_in_daylight",
 }
 _HRV_STATUS_MAX_AGE_MIN = 24 * 60
 
@@ -56,6 +56,8 @@ ALLOWED_TYPES: list[str] = [
     "step_count", "flights_climbed", "walking_running_distance",
     "active_energy_burned", "apple_exercise_time",
     "apple_sleeping_wrist_temperature",
+    # Context, not vitals: did they get outside today, and how loud is it there.
+    "time_in_daylight", "environmental_audio_exposure",
 ]
 _env_allowed = os.environ.get("HEALTH_ALLOWED_TYPES", "").strip()
 if _env_allowed:
@@ -917,6 +919,20 @@ def health_now(hours: float = 6) -> Any:
         km = _as_km(dist["today_total"], dist.get("unit"))
         if km is not None:
             out["walking_running_distance"] = f"{round(km, 1)} km"
+
+    # Context rather than vitals: whether they got outside today, and how loud
+    # it is around them. Daylight is a daily total; noise is a level, so the
+    # latest reading is what matters.
+    daylight = h.get("time_in_daylight")
+    if isinstance(daylight, dict) and daylight.get("today_total") is not None:
+        mins = _n(daylight["today_total"])
+        if mins is not None:
+            out["time_in_daylight"] = (f"{mins // 60} hr {mins % 60} min"
+                                       if mins >= 60 else f"{mins} min")
+    noise = h.get("environmental_audio_exposure")
+    if isinstance(noise, dict) and noise.get("latest") is not None:
+        out["environmental_audio_exposure"] = (
+            f"{_n(noise['latest'])} dB, {_ago(noise.get('age_min'))}")
     return out or "connected, waiting for first samples"
 
 

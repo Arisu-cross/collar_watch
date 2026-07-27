@@ -354,3 +354,20 @@ def test_distance_in_miles_is_converted(client, monkeypatch):
                             "2026-07-27T20:00:00+08:00"))
     out = _totals(client, "walking_running_distance", "mi", [5.0])
     assert out["walking_running_distance"] == "8.0 km"
+
+
+def test_daylight_and_noise_reach_health_now(client, monkeypatch):
+    """Context metrics: a daily total for daylight, a latest level for noise."""
+    monkeypatch.setattr(sys.modules["health_store"], "_now",
+                        lambda: __import__("datetime").datetime.fromisoformat(
+                            "2026-07-27T20:00:00+08:00"))
+    client.post("/api/health", headers=_auth(), json={"data": {"metrics": [
+        {"name": "time_in_daylight", "units": "min", "data": [
+            {"date": "2026-07-27 11:00:00 +0800", "qty": 45},
+            {"date": "2026-07-27 15:00:00 +0800", "qty": 50}]},
+        {"name": "environmental_audio_exposure", "units": "dBASPL", "data": [
+            {"date": "2026-07-27 19:30:00 +0800", "Avg": 72}]},
+    ]}})
+    out = sys.modules["health_store"].health_now()
+    assert out["time_in_daylight"] == "1 hr 35 min"      # summed across the day
+    assert out["environmental_audio_exposure"].startswith("72 dB")
