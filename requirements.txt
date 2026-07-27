@@ -1,3 +1,8 @@
 # The data layer (server/health_store.py) is pure standard library — no deps.
-# This is only needed to run the MCP server (mcp_server/server.py).
+#
+# These are needed to run the MCP server (mcp_server/server.py) and the HTTP
+# ingest shell (server/app.py). starlette and uvicorn already ship as mcp
+# dependencies; they are pinned here because app.py imports them directly.
 mcp>=1.0
+starlette>=0.37
+uvicorn>=0.30

@@ -13,7 +13,7 @@ MCP tool (measure_heart_rate)
 CollarWatch：HKWorkoutSession 30s 高频采样 → avg/min/max/样本数
 ```
 
-**ingest 侧要挂的两个新口**（数据层函数已在 `health_store.py`，HTTP 壳照旧自备）：
+**ingest 侧的两个口**（`server/app.py` 已经挂好了；只要数据层，执行体也在 `health_store.py`）：
 
 - `GET /command` → 执行体 `fetch_pending_command()`。有指令返回 `{"command": "measure_heart_rate", "command_id": "...", "duration_seconds": 30, ...}`，没有返回 `{"command": null}`
 - `POST /command/result` ← 手表送来 `{"command_id": "...", "result": {"heart_rate_average": 83, ...}}`，执行体 `complete_command()`
@@ -187,36 +187,85 @@ open CollarWatch.xcodeproj
 
 ## 服务端接入
 
-`server/health_store.py` 是**数据层**，不是完整的 Web 服务。仓库没有替你决定 FastAPI、Flask、反向代理、域名或鉴权方式。
+`server/app.py` 是一个开箱即用的服务：一个进程、一个数据目录，同时提供 ingest 路由和 MCP 端点。
 
-你需要在自己的 HTTPS ingest endpoint 中完成两件事：
+```bash
+pip install -r requirements.txt
+export HEALTH_DATA_DIR=./data/health
+export HEALTH_INGEST_TOKEN=<给设备用的随机长 token>
+export COLLAR_MCP_TOKEN=<给 agent 用的另一个随机长 token>
+python server/app.py          # 监听 $PORT，默认 8080
+```
 
-1. 校验 `X-Health-Token`；
-2. 把 JSON body 交给 `normalize_payload()` / `store_samples()`。
+或者用容器：
 
-示意：
+```bash
+docker build -t collar .
+docker run -p 8080:8080 -v collar-data:/app/data \
+  -e HEALTH_INGEST_TOKEN=... -e COLLAR_MCP_TOKEN=... collar
+```
+
+| 路由 | 方法 | 鉴权 | 用途 |
+|---|---|---|---|
+| `/health` | GET | 无 | 探活 |
+| `/api/health` | POST | 设备 | ingest，CollarWatch 与 HAE 两种 payload 都收 |
+| `/command` | GET | 设备 | CollarWatch 领取待执行的测量指令 |
+| `/command/result` | POST | 设备 | CollarWatch 回执测量结果 |
+| `/debug` | GET | 设备 | 诊断（见下） |
+| `/mcp` | POST | agent | MCP streamable-http |
+
+**两套凭据是有意分开的。** 设备用 `HEALTH_INGEST_TOKEN`（`X-Health-Token` 头——手表代码里写死的就是它；也接受 `Authorization: Bearer` 和 `?token=`，因为不是每个导出工具都允许自定义请求头）。agent 用 `COLLAR_MCP_TOKEN`（`Authorization: Bearer` 或 `X-Token`，两个都认）。能写入数据的设备没理由把整段历史读回去。
+
+**两个 token 都未配置时一律返回 401**，不会悄悄裸奔。本地开发可以用 `COLLAR_ALLOW_NO_AUTH=1` 显式关掉。
+
+如果你只想要数据层、Web 壳自己写，`health_store.py` 照旧可以单独用：
 
 ```python
 from health_store import ALLOWED_TYPES, normalize_payload, store_samples
 
-# 先在你的 Web 层校验 X-Health-Token。
-# 验证通过后：
 samples = normalize_payload(body)
 samples = [s for s in samples if s["type"] in ALLOWED_TYPES]
 stored, deduped = store_samples(samples)
 ```
 
-**注意：当前仓库本身没有 HTTP ingest server，也不会自动读取请求头。** `.env.example` 中的 `HEALTH_INGEST_TOKEN` 只是给你自己的入口层使用的约定。不要把未鉴权的写入接口直接暴露到公网。
+### `/debug`：指标命名校准
+
+不同导出端对同一个指标的叫法不一样（HAE 发 `active_energy`，手表端发 `active_energy_burned`），对不上的样本会被 allow-list 直接丢掉，而且**是静默丢的**。`/debug` 把这件事摊开：
+
+```bash
+curl "https://<你的域名>/debug?token=$HEALTH_INGEST_TOKEN"
+```
+
+返回里 `accepted_types` / `dropped_types` / `units_seen` 就是校准依据——照着 `dropped_types` 里出现的名字往 `HEALTH_TYPE_ALIASES` 里补映射即可，不用改代码。内置了几条常见的（`active_energy`、`oxygen_saturation`、`heart_rate_variability_sdnn` 等）。
+
+**不要照文档猜导出端的命名，拿真实数据看一眼 `/debug`。**
+
+### ⚠️ 部署时两个容易踩的坑
+
+- **端口**：很多 PaaS 会往容器里注入自己的 `PORT` 并把流量路由到那个端口。`app.py` 读 `$PORT`，但如果平台的模板里另外声明了一个不同的端口，就会出现「服务健康、请求全 502」。让两边对齐。
+- **`COLLAR_ALLOWED_HOSTS`**：MCP SDK 自带 DNS-rebinding 防护，**默认开启且允许列表为空**，效果是对任何 Host 都回 421。本项目因此默认把它关掉（`/mcp` 已经有 bearer token 挡着，浏览器里的 rebinding 攻击者没法在跨域请求上设置 Authorization 头）。要开就必须把你自己的域名列进去，漏了自己的域名等于把端点彻底关死。
 
 ## MCP
 
-MCP server 需要 Python 3.10 或更高版本：
+需要 Python 3.10 或更高版本。有两种接法。
 
-```bash
-pip install -r requirements.txt
+**远程（推荐）**：`server/app.py` 已经把这些工具挂在 `/mcp` 上，agent 直接连网络地址，本地不用起进程：
+
+```json
+{
+  "mcpServers": {
+    "collar": {
+      "type": "http",
+      "url": "https://<你的域名>/mcp",
+      "headers": { "Authorization": "Bearer <COLLAR_MCP_TOKEN>" }
+    }
+  }
+}
 ```
 
-配置示例：
+这条链路是**无状态**的：服务重启不会让 agent 手里的连接失效，也不需要先握手才能调用。
+
+**本地 stdio**：agent 和数据在同一台机器上时，直接拉起脚本：
 
 ```json
 {
@@ -233,7 +282,7 @@ pip install -r requirements.txt
 }
 ```
 
-提供两个工具：
+提供三个工具：
 
 ### `health_now`
 
@@ -252,7 +301,22 @@ pip install -r requirements.txt
 - 心率 / HRV / 呼吸：最近最多 2 小时的逐点样本和 min / max / avg；
 - 睡眠：指定日期的睡眠阶段时间轴、睡眠期 vitals 与最近 7 天平均睡眠时长。
 
+### `measure_heart_rate`
+
+要一个**当下**的心率读数：下一条指令，手表开一段短 workout session 实测后回传。**只在装了 Watch app 时可用**——HAE 没有这个能力。
+
 把 MCP 接给任何 agent，都意味着那个 agent 在调用工具时能够读取这些健康数据。请按你自己的信任边界配置 MCP 和服务器权限。
+
+## 没有 Mac 怎么办
+
+Watch app 是独立 watchOS 应用（`WKWatchOnly`，没有 iPhone 容器），**构建和安装都必须经过 macOS 上的 Xcode**。从 Windows 或 Linux 侧没有可行路径：Sideloadly / AltStore 那类工具装的是 iOS `.ipa`，靠 iPhone 容器捎带 watch extension，而这个项目没有容器可捎。
+
+没有 Mac 但想用起来，走 **HAE 兼容模式**（见下节）：iPhone 上装 Health Auto Export，配一条 REST 自动化指向 `/api/health`。全程只需要手机。
+
+- **能拿到**：心率、静息心率、HRV、呼吸、睡眠阶段、腕温、步数、距离、爬楼、活动能量、运动时间——被动数据一样不少。
+- **拿不到**：`measure_heart_rate`（那是 Watch app 独有的），以及手表链路 10–20 分钟一轮的稳定延迟。
+
+服务端两条链路进的是同一个口，所以将来补装 Watch app 时**服务端一行都不用改**。
 
 ## 配置项
 
@@ -313,13 +377,17 @@ HAE 关于自动化限制的官方说明：
 ```text
 health-collar/
 ├── server/
-│   └── health_store.py          # 归一化、落盘、汇总、查询
+│   ├── health_store.py          # 归一化、落盘、汇总、查询（纯标准库）
+│   └── app.py                   # HTTP: ingest + 指令通道 + /mcp
 ├── mcp_server/
-│   └── server.py                # health_now / health_detail
+│   └── server.py                # health_now / health_detail / measure_heart_rate
 ├── watch/
 │   ├── Sources/                 # Watch app
 │   ├── Widget/                  # 表盘 complication
 │   └── project.yml              # XcodeGen 配置
+├── tests/
+│   └── test_app.py              # pytest -q
+├── Dockerfile
 ├── .env.example
 ├── requirements.txt
 └── LICENSE
