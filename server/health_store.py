@@ -380,6 +380,32 @@ def _sample_points(rows: list[dict[str, Any]], max_points: int) -> list[dict[str
     return points
 
 
+def _as_kcal(value: Any, unit: Any) -> Optional[float]:
+    """Energy to kcal. Health Auto Export reports kJ, the watch app kcal."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    u = str(unit or "").strip().lower()
+    if u in ("kj", "kilojoule", "kilojoules"):
+        return v / 4.184
+    return v
+
+
+def _as_km(value: Any, unit: Any) -> Optional[float]:
+    """Distance to km. Health Auto Export reports km, the watch app miles."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    u = str(unit or "").strip().lower()
+    if u in ("mi", "mile", "miles"):
+        return v * 1.609344
+    if u in ("m", "meter", "meters"):
+        return v / 1000.0
+    return v
+
+
 def _rounded_total(stype: str, values: list[float]) -> Optional[float | int]:
     if not values:
         return None
@@ -871,17 +897,26 @@ def health_now(hours: float = 6) -> Any:
         except (TypeError, ValueError):
             return x
 
-    for key, unit in [("step_count", ""), ("active_energy_burned", " kcal"),
-                      ("apple_exercise_time", " min"), ("flights_climbed", "")]:
+    for key, unit in [("step_count", ""), ("apple_exercise_time", " min"),
+                      ("flights_climbed", "")]:
         m = h.get(key)
         if isinstance(m, dict) and m.get("today_total") is not None:
             out[key] = f"{_int(m['today_total'])}{unit}"
+
+    # Energy and distance are reported in different units by different sources —
+    # the watch app sends kcal and miles, Health Auto Export sends kJ and km.
+    # Convert from whatever actually arrived rather than assuming one of them,
+    # otherwise the figure is silently wrong by a constant factor.
+    energy = h.get("active_energy_burned")
+    if isinstance(energy, dict) and energy.get("today_total") is not None:
+        kcal = _as_kcal(energy["today_total"], energy.get("unit"))
+        if kcal is not None:
+            out["active_energy_burned"] = f"{_int(kcal)} kcal"
     dist = h.get("walking_running_distance")
     if isinstance(dist, dict) and dist.get("today_total") is not None:
-        try:
-            out["walking_running_distance"] = f"{round(float(dist['today_total']) * 1.609344, 1)} km"
-        except (TypeError, ValueError):
-            pass
+        km = _as_km(dist["today_total"], dist.get("unit"))
+        if km is not None:
+            out["walking_running_distance"] = f"{round(km, 1)} km"
     return out or "connected, waiting for first samples"
 
 

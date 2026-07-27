@@ -303,3 +303,54 @@ def test_mcp_health_now_reads_ingested_data(client):
     body = json.dumps(r.json())
     assert "heart_rate" in body
     assert "75" in body  # the newer of the two samples
+
+
+# ------------------------------------------------------------
+# Unit conversion
+#
+# The watch app and Health Auto Export disagree on units for exactly two
+# metrics. Reading the source's own unit is the only thing standing between a
+# correct figure and one that is wrong by a constant factor.
+# ------------------------------------------------------------
+
+def _totals(client, metric, unit, values, at="2026-07-27T10:00:00+08:00"):
+    client.post("/api/health", headers=_auth(), json={
+        "source": "watch",
+        "samples": [{"type": metric, "value": v, "unit": unit, "at": at}
+                    for v in values]})
+    hs = sys.modules["health_store"]
+    return hs.health_now()
+
+
+def test_energy_in_kilojoules_is_converted(client, monkeypatch):
+    monkeypatch.setattr(sys.modules["health_store"], "_now",
+                        lambda: __import__("datetime").datetime.fromisoformat(
+                            "2026-07-27T20:00:00+08:00"))
+    out = _totals(client, "active_energy_burned", "kJ", [418.4])
+    # 418.4 kJ is 100 kcal — labelling it "418 kcal" overstates it 4.2x.
+    assert out["active_energy_burned"] == "100 kcal"
+
+
+def test_energy_in_kcal_is_left_alone(client, monkeypatch):
+    monkeypatch.setattr(sys.modules["health_store"], "_now",
+                        lambda: __import__("datetime").datetime.fromisoformat(
+                            "2026-07-27T20:00:00+08:00"))
+    out = _totals(client, "active_energy_burned", "kcal", [250.0])
+    assert out["active_energy_burned"] == "250 kcal"
+
+
+def test_distance_in_km_is_not_rescaled(client, monkeypatch):
+    monkeypatch.setattr(sys.modules["health_store"], "_now",
+                        lambda: __import__("datetime").datetime.fromisoformat(
+                            "2026-07-27T20:00:00+08:00"))
+    out = _totals(client, "walking_running_distance", "km", [5.0])
+    # Previously multiplied by 1.609344 unconditionally, inflating km sources.
+    assert out["walking_running_distance"] == "5.0 km"
+
+
+def test_distance_in_miles_is_converted(client, monkeypatch):
+    monkeypatch.setattr(sys.modules["health_store"], "_now",
+                        lambda: __import__("datetime").datetime.fromisoformat(
+                            "2026-07-27T20:00:00+08:00"))
+    out = _totals(client, "walking_running_distance", "mi", [5.0])
+    assert out["walking_running_distance"] == "8.0 km"
