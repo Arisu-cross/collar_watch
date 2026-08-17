@@ -30,7 +30,7 @@ targets:
         WKBackgroundModes:
           - workout-processing
         # 直写模板,不走 INFOPLIST_KEY 注入:healthd 侧校验对注入机制有过冤案
-        NSHealthShareUsageDescription: "Collar 读取心率与睡眠,同步到你自己的服务器。"
+        NSHealthShareUsageDescription: "Collar 读取心率、睡眠、血氧、音量暴露与经期记录,同步到你自己的服务器。"
         # ⚠️ 这句必须是正经的用户向描述。HealthKit 会在运行时审查文案质量,
         # 占位敷衍文案(如旧句"仅测试环境写入模拟数据。")会在请求写权限时被判
         # invalid 直接闪退(NSInvalidArgumentException)。别写敷衍话。
@@ -41,7 +41,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_CFBundleDisplayName: Collar
-        INFOPLIST_KEY_NSHealthShareUsageDescription: "Collar 读取心率与睡眠,同步到你自己的服务器。"
+        INFOPLIST_KEY_NSHealthShareUsageDescription: "Collar 读取心率、睡眠、血氧、音量暴露与经期记录,同步到你自己的服务器。"
         # 与上方 info.properties 保持同句(文案质量审查见上方注释)
         INFOPLIST_KEY_NSHealthUpdateUsageDescription: "Collar 在测量心率时需要记录体能训练会话数据。"
         CURRENT_PROJECT_VERSION: 1

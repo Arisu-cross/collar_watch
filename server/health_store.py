@@ -9,6 +9,7 @@
 #       <DATA_DIR>/samples-YYYYMMDD.jsonl  raw samples, rolling 48h retention
 #       <DATA_DIR>/wrist_baseline.json     cumulative wrist-temp baseline
 #       <DATA_DIR>/sleep_history.jsonl     daily sleep summaries, 30d retention
+#       <DATA_DIR>/cycle_history.jsonl     menstrual flow by day, 400d retention
 #   - Display times use a configurable UTC offset; machine fields store UTC.
 #
 #   Environment:
@@ -35,7 +36,9 @@ _DATA_DIR = Path(os.environ.get("HEALTH_DATA_DIR", "./data/health")).expanduser(
 _LATEST = _DATA_DIR / "latest.json"
 _WRIST_BASELINE = _DATA_DIR / "wrist_baseline.json"
 _SLEEP_HISTORY = _DATA_DIR / "sleep_history.jsonl"
+_CYCLE_HISTORY = _DATA_DIR / "cycle_history.jsonl"
 _WRIST_TYPE = "apple_sleeping_wrist_temperature"
+_CYCLE_TYPE = "menstrual_flow"
 
 # Drill/test sources are stored but excluded from the status view.
 _STATUS_EXCLUDED_SOURCES = {"filter_test", "drill"}
@@ -48,18 +51,63 @@ _CUMULATIVE_TYPES = {
 }
 _HRV_STATUS_MAX_AGE_MIN = 24 * 60
 
+# Audio exposure arrives as interval samples that already carry an average dB
+# level, so summing them is meaningless: the status view reports today's peak
+# and sample mean instead. Apple's own "loud" threshold is 80 dB(A).
+_AUDIO_TYPES = {"environmental_audio_exposure", "headphone_audio_exposure"}
+_AUDIO_LOUD_DB = 80.0
+
+# Category samples whose numeric value is a code, not a measurement: min/max/avg
+# over them would be nonsense, so the range stats are skipped.
+_NON_NUMERIC_TYPES = {_CYCLE_TYPE}
+
+# Normally a sample is identified by (type, at). Editing a cycle-tracking entry
+# in the Health app keeps the same day but changes the flow level, so for these
+# types the value joins the dedup key — otherwise the correction is silently
+# dropped as a duplicate and the history keeps the old level forever.
+_VALUE_KEYED_TYPES = {_CYCLE_TYPE}
+
 # Type allow-list: only ingest the metrics that matter; anything else is dropped
 # at the door. Override with the HEALTH_ALLOWED_TYPES env var if you need more.
+# Dropping "menstrual_flow" from this list is also the off switch for the whole
+# cycle feature (ingest and the health_now / health_detail views alike).
 ALLOWED_TYPES: list[str] = [
     "heart_rate", "heart_rate_variability", "resting_heart_rate",
     "sleep_analysis", "respiratory_rate", "blood_oxygen_saturation",
     "step_count", "flights_climbed", "walking_running_distance",
     "active_energy_burned", "apple_exercise_time",
     "apple_sleeping_wrist_temperature",
+    "environmental_audio_exposure", "headphone_audio_exposure",
+    _CYCLE_TYPE,
 ]
 _env_allowed = os.environ.get("HEALTH_ALLOWED_TYPES", "").strip()
 if _env_allowed:
     ALLOWED_TYPES = [t.strip() for t in _env_allowed.split(",") if t.strip()]
+
+# Health Auto Export names a few of these differently than the watch does.
+_TYPE_ALIASES = {
+    "menstruation": _CYCLE_TYPE,
+    "oxygen_saturation": "blood_oxygen_saturation",
+}
+
+# HKCategoryValueMenstrualFlow codes, for payloads that carry the raw value
+# without the watch app's readable "flow" label.
+_FLOW_NAMES = {1: "unspecified", 2: "light", 3: "medium", 4: "heavy", 5: "none"}
+_CYCLE_HISTORY_DAYS = 400
+# Bleeding days this far apart still count as one period (a gap day mid-period
+# is common); anything longer starts a new one.
+_CYCLE_PERIOD_GAP_DAYS = 2
+# Cycle lengths outside this range are treated as gaps in logging, not cycles.
+_CYCLE_MIN_LEN, _CYCLE_MAX_LEN = 15, 60
+
+# Per-metric window cap for health_detail. Dense metrics stay at 2h so a reply
+# is not a wall of points; sparse ones (a handful of samples a day) get a day,
+# still inside the 48h raw-sample retention.
+_DETAIL_MAX_HOURS = {
+    "heart_rate": 2, "heart_rate_variability": 2, "respiratory_rate": 2,
+    "blood_oxygen_saturation": 24,
+    "environmental_audio_exposure": 24, "headphone_audio_exposure": 24,
+}
 
 
 def _now() -> datetime:
@@ -115,6 +163,7 @@ def normalize_payload(body: Any) -> list[dict[str, Any]]:
                 continue
             at = _parse_dt(s.get("at"))
             stype = str(s.get("type") or "").strip().lower()
+            stype = _TYPE_ALIASES.get(stype, stype)
             if not stype or at is None:
                 continue
             extra = s.get("extra") if isinstance(s.get("extra"), dict) else None
@@ -142,6 +191,7 @@ def normalize_payload(body: Any) -> list[dict[str, Any]]:
             if not isinstance(m, dict):
                 continue
             stype = str(m.get("name") or "").strip().lower()
+            stype = _TYPE_ALIASES.get(stype, stype)
             unit = str(m.get("units") or "")[:20]
             for d in m.get("data") or []:
                 if not isinstance(d, dict):
@@ -176,6 +226,13 @@ def _day_file(dt: datetime) -> Path:
     return _DATA_DIR / f"samples-{dt.astimezone(_TZ).strftime('%Y%m%d')}.jsonl"
 
 
+def _dedup_key(s: dict[str, Any]) -> tuple:
+    stype = s.get("type")
+    if stype in _VALUE_KEYED_TYPES:
+        return (stype, s.get("at"), s.get("value"))
+    return (stype, s.get("at"))
+
+
 def _load_seen_keys() -> set:
     seen = set()
     now = _now()
@@ -185,8 +242,7 @@ def _load_seen_keys() -> set:
         try:
             for line in f.read_text(encoding="utf-8").splitlines():
                 try:
-                    s = json.loads(line)
-                    seen.add((s.get("type"), s.get("at")))
+                    seen.add(_dedup_key(json.loads(line)))
                 except Exception:
                     continue
         except Exception:
@@ -266,8 +322,9 @@ def store_samples(samples: list[dict[str, Any]]) -> tuple[int, int]:
     by_file: dict[Path, list[str]] = {}
     new_wrist: list[float] = []
     new_sleep: list[dict[str, Any]] = []
+    new_cycle: list[dict[str, Any]] = []
     for s in sorted(samples, key=lambda x: str(x.get("at") or "")):
-        key = (s.get("type"), s.get("at"))
+        key = _dedup_key(s)
         if key in seen:
             deduped += 1
             continue
@@ -281,6 +338,8 @@ def store_samples(samples: list[dict[str, Any]]) -> tuple[int, int]:
                 pass
         if s.get("type") == "sleep_analysis" and str(s.get("source") or "") == "watch":
             new_sleep.append(s)
+        if s.get("type") == _CYCLE_TYPE:
+            new_cycle.append(s)
         at = _parse_dt(s["at"]) or _now()
         by_file.setdefault(_day_file(at), []).append(_json(s))
         prev = latest.get(s["type"]) or {}
@@ -303,6 +362,7 @@ def store_samples(samples: list[dict[str, Any]]) -> tuple[int, int]:
 
     _update_wrist_baseline(new_wrist)
     _update_sleep_history(new_sleep)
+    _update_cycle_history(new_cycle)
     _cleanup_old_files()
     return stored, deduped
 
@@ -458,7 +518,7 @@ def health_summary(*, hours: float = 6, start: Any = None, end: Any = None,
         hour=0, minute=0, second=0, microsecond=0)
     today_rows = _samples_between(
         today_start, now,
-        types=status_types & _CUMULATIVE_TYPES,
+        types=status_types & (_CUMULATIVE_TYPES | _AUDIO_TYPES),
         exclude_sources=_STATUS_EXCLUDED_SOURCES)
     today_grouped: dict[str, list[dict[str, Any]]] = {}
     for s in today_rows:
@@ -510,6 +570,26 @@ def health_summary(*, hours: float = 6, start: Any = None, end: Any = None,
                 continue
         metric["today_total"] = _rounded_total(stype, values)
 
+    for stype in status_types & _AUDIO_TYPES:
+        metric = out.get(stype)
+        if not isinstance(metric, dict):
+            continue
+        values = []
+        for sample in today_grouped.get(stype, []):
+            try:
+                if sample.get("value") is not None:
+                    values.append(float(sample.get("value")))
+            except (TypeError, ValueError):
+                continue
+        if not values:
+            continue
+        metric["today_max"] = round(max(values), 1)
+        # Unweighted mean of the interval samples — a rough "how loud was today",
+        # not a duration-weighted exposure level.
+        metric["today_avg"] = round(sum(values) / len(values), 1)
+        metric["today_n"] = len(values)
+        metric["today_loud_n"] = sum(1 for v in values if v >= _AUDIO_LOUD_DB)
+
     hrv = out.get("heart_rate_variability")
     if isinstance(hrv, dict):
         hint = _stress_hint_from_hrv(hrv.get("latest"), hrv.get("age_min"))
@@ -523,12 +603,13 @@ def health_summary(*, hours: float = 6, start: Any = None, end: Any = None,
     for stype, rows in grouped.items():
         rows.sort(key=lambda s: str(s.get("at") or ""))
         vals = []
-        for s in rows:
-            try:
-                if s.get("value") is not None:
-                    vals.append(float(s.get("value")))
-            except Exception:
-                continue
+        if stype not in _NON_NUMERIC_TYPES:
+            for s in rows:
+                try:
+                    if s.get("value") is not None:
+                        vals.append(float(s.get("value")))
+                except Exception:
+                    continue
         latest_row = rows[-1]
         latest_at = _parse_dt(latest_row.get("at"))
         metric = out.setdefault(stype, {})
@@ -675,36 +756,205 @@ def sleep_7day_avg():
 
 
 # ------------------------------------------------------------
+# Menstrual cycle
+#   Raw samples only live 48h, so cycle tracking needs its own long history:
+#   one record per logged day, from which periods and cycle lengths are derived.
+#   Everything here is descriptive bookkeeping of what was logged in the Health
+#   app — the "prediction" is just last start + average cycle length.
+# ------------------------------------------------------------
+
+def _flow_label(sample: dict[str, Any]) -> str:
+    """Readable flow level. The watch app sends it in extra; other sources may
+    only send the raw HKCategoryValueMenstrualFlow code."""
+    extra = sample.get("extra") if isinstance(sample.get("extra"), dict) else {}
+    label = str((extra or {}).get("flow") or "").strip().lower()
+    if label in set(_FLOW_NAMES.values()):
+        return label
+    try:
+        return _FLOW_NAMES.get(int(float(sample.get("value"))), "unspecified")
+    except (TypeError, ValueError):
+        return "unspecified"
+
+
+def _load_cycle_history() -> list[dict[str, Any]]:
+    if not _CYCLE_HISTORY.exists():
+        return []
+    hist: dict[str, dict[str, Any]] = {}
+    try:
+        for line in _CYCLE_HISTORY.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+                if r.get("date"):
+                    hist[r["date"]] = r
+            except Exception:
+                continue
+    except Exception:
+        logger.warning("health_store: cycle_history read failed", exc_info=True)
+        return []
+    return [hist[k] for k in sorted(hist)]
+
+
+def _update_cycle_history(cycle_samples: list[dict[str, Any]]) -> None:
+    """One record per logged day. A corrected entry (same day, new flow level)
+    wins by sample time — that is why menstrual_flow is value-keyed on ingest."""
+    if not cycle_samples:
+        return
+    hist = {r["date"]: r for r in _load_cycle_history() if r.get("date")}
+    changed = False
+    for s in cycle_samples:
+        at = _parse_dt(s.get("at"))
+        if at is None:
+            continue
+        date = at.astimezone(_TZ).strftime("%Y-%m-%d")
+        prev = hist.get(date)
+        if prev and str(prev.get("at") or "") > str(s.get("at") or ""):
+            continue
+        extra = s.get("extra") if isinstance(s.get("extra"), dict) else {}
+        hist[date] = {
+            "date": date,
+            "flow": _flow_label(s),
+            "cycle_start": bool((extra or {}).get("cycle_start")),
+            "at": s.get("at"),
+            "source": s.get("source"),
+        }
+        changed = True
+    if not changed:
+        return
+    cutoff = (_now().astimezone(_TZ) - timedelta(days=_CYCLE_HISTORY_DAYS)).strftime("%Y-%m-%d")
+    kept = {k: v for k, v in hist.items() if k >= cutoff}
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(_DATA_DIR), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for k in sorted(kept):
+                fh.write(_json(kept[k]) + "\n")
+        os.replace(tmp, _CYCLE_HISTORY)
+    except Exception:
+        logger.warning("health_store: cycle_history write failed", exc_info=True)
+
+
+def _cycle_periods(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group logged bleeding days into periods. A one-day gap mid-period is
+    normal (nothing logged that day), so days up to _CYCLE_PERIOD_GAP_DAYS apart
+    stay in the same period; an explicit cycle_start flag always opens a new one."""
+    periods: list[dict[str, Any]] = []
+    for r in records:
+        if r.get("flow") == "none":
+            continue
+        try:
+            day = datetime.strptime(str(r.get("date")), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        last = periods[-1] if periods else None
+        if (last is not None and not r.get("cycle_start")
+                and (day - last["end"]).days <= _CYCLE_PERIOD_GAP_DAYS):
+            last["end"] = day
+            last["logged_days"] += 1
+        else:
+            periods.append({"start": day, "end": day, "logged_days": 1})
+    for p in periods:
+        p["days"] = (p["end"] - p["start"]).days + 1
+    return periods
+
+
+def cycle_status() -> Optional[dict[str, Any]]:
+    """Where the cycle currently stands, plus the averages it is derived from.
+    Returns None when nothing has ever been logged."""
+    records = _load_cycle_history()
+    if not records:
+        return None
+    today = _now().astimezone(_TZ).date()
+    flow_today = next((r.get("flow") for r in records
+                       if r.get("date") == today.strftime("%Y-%m-%d")), None)
+    periods = _cycle_periods(records)
+    if not periods:
+        return {"logged_days": len(records),
+                "note": "cycle entries logged, but no bleeding days among them"}
+
+    last = periods[-1]
+    ongoing = (today - last["end"]).days <= 1
+    cycle_day = (today - last["start"]).days + 1
+    lengths = [(b["start"] - a["start"]).days for a, b in zip(periods, periods[1:])]
+    lengths = [n for n in lengths if _CYCLE_MIN_LEN <= n <= _CYCLE_MAX_LEN]
+    recent_lengths = lengths[-6:]
+    recent_periods = periods[-6:]
+
+    out: dict[str, Any] = {
+        "cycle_day": cycle_day,
+        "state": (f"period, day {cycle_day}" if ongoing
+                  else f"day {cycle_day} of cycle"),
+        "last_period_start": last["start"].strftime("%Y-%m-%d"),
+        "last_period_days": last["days"],
+        "avg_period_days": round(sum(p["days"] for p in recent_periods) / len(recent_periods), 1),
+        "based_on_cycles": len(recent_lengths),
+        "logged_days": len(records),
+    }
+    if flow_today:
+        out["flow_today"] = flow_today
+    if recent_lengths:
+        avg_cycle = round(sum(recent_lengths) / len(recent_lengths))
+        predicted = last["start"] + timedelta(days=avg_cycle)
+        out["avg_cycle_days"] = avg_cycle
+        out["predicted_next_start"] = predicted.strftime("%Y-%m-%d")
+        out["days_until_next"] = (predicted - today).days
+    else:
+        out["note"] = ("only one period logged so far - no cycle length to "
+                       "predict from yet")
+    return out
+
+
+# ------------------------------------------------------------
 # Detail query (drives the health_detail LLM/MCP tool; see mcp/ later)
 # ------------------------------------------------------------
 
 async def execute_health_detail(arguments=None) -> str:
     """health_detail tool: for heart_rate / HRV / respiratory, sample + min/max/avg
-    over a window (<=2h). For sleep, query a night's stage timeline + period vitals
-    + wrist temperature. Raw samples are kept only 48h."""
+    over a window (<=2h); same for blood oxygen and the two audio-exposure metrics
+    (<=24h, they are far sparser). For sleep, query a night's stage timeline +
+    period vitals + wrist temperature. For cycle, the logged periods and the
+    cycle lengths derived from them. Raw samples are kept only 48h; sleep and
+    cycle have their own long-term history files."""
     args = arguments or {}
     metric = str(args.get("metric") or "heart_rate").strip().lower()
     alias = {"hr": "heart_rate", "hrv": "heart_rate_variability", "sleep": "sleep_analysis",
-             "respiratory": "respiratory_rate", "breath": "respiratory_rate", "resp": "respiratory_rate"}
+             "respiratory": "respiratory_rate", "breath": "respiratory_rate", "resp": "respiratory_rate",
+             "spo2": "blood_oxygen_saturation", "blood_oxygen": "blood_oxygen_saturation",
+             "oxygen": "blood_oxygen_saturation",
+             "noise": "environmental_audio_exposure", "environment": "environmental_audio_exposure",
+             "environmental": "environmental_audio_exposure",
+             "headphone": "headphone_audio_exposure", "headphones": "headphone_audio_exposure",
+             "cycle": _CYCLE_TYPE, "period": _CYCLE_TYPE, "menstrual": _CYCLE_TYPE}
     metric = alias.get(metric, metric)
     if metric == "sleep_analysis":
         return _health_sleep_query(args)
-    if metric not in {"heart_rate", "heart_rate_variability", "respiratory_rate"}:
-        return _json({"ok": False, "error": f"unknown metric '{metric}'; use heart_rate / heart_rate_variability / respiratory_rate / sleep"})
+    if metric == _CYCLE_TYPE:
+        return _health_cycle_query(args)
+    if metric not in _DETAIL_MAX_HOURS:
+        return _json({"ok": False, "error": f"unknown metric '{metric}'; use "
+                      + " / ".join(sorted(_DETAIL_MAX_HOURS)) + " / sleep / cycle"})
+    # Sparse metrics (a handful of samples a day) get a wider window than the
+    # dense ones, still inside the 48h raw-sample retention.
+    max_hours = _DETAIL_MAX_HOURS[metric]
     now = _now()
     end = _parse_range_dt(args.get("to")) or now
-    start = _parse_range_dt(args.get("from")) or (end - timedelta(hours=2))
-    if end - start > timedelta(hours=2):
-        start = end - timedelta(hours=2)
+    start = _parse_range_dt(args.get("from")) or (end - timedelta(hours=max_hours))
+    if end - start > timedelta(hours=max_hours):
+        start = end - timedelta(hours=max_hours)
     rows = _samples_between(start, end, types={metric}, exclude_sources=_STATUS_EXCLUDED_SOURCES)
     vals = [float(r["value"]) for r in rows if r.get("value") is not None]
-    pts = [{"time": _parse_dt(r["at"]).astimezone(_TZ).strftime("%H:%M"), "value": round(float(r["value"]), 1)}
+    # A window longer than half a day needs the date to stay readable.
+    tfmt = "%H:%M" if max_hours <= 12 else "%m-%d %H:%M"
+    pts = [{"time": _parse_dt(r["at"]).astimezone(_TZ).strftime(tfmt), "value": round(float(r["value"]), 1)}
            for r in rows if r.get("value") is not None]
-    return _json({"ok": True, "metric": metric,
-                  "window": start.astimezone(_TZ).strftime("%H:%M") + " -> " + end.astimezone(_TZ).strftime("%H:%M"),
-                  "sample_count": len(vals), "min": round(min(vals), 1) if vals else None,
-                  "max": round(max(vals), 1) if vals else None,
-                  "avg": round(sum(vals) / len(vals), 1) if vals else None, "samples": pts})
+    out = {"ok": True, "metric": metric,
+           "window": start.astimezone(_TZ).strftime(tfmt) + " -> " + end.astimezone(_TZ).strftime(tfmt),
+           "sample_count": len(vals), "min": round(min(vals), 1) if vals else None,
+           "max": round(max(vals), 1) if vals else None,
+           "avg": round(sum(vals) / len(vals), 1) if vals else None, "samples": pts}
+    if metric in _AUDIO_TYPES and vals:
+        out["loud_sample_count"] = sum(1 for v in vals if v >= _AUDIO_LOUD_DB)
+        out["loud_threshold_db"] = _AUDIO_LOUD_DB
+    return _json(out)
 
 
 def _health_sleep_query(args) -> str:
@@ -756,6 +1006,31 @@ def _health_sleep_query(args) -> str:
                   "stage_timeline": timeline})
 
 
+def _health_cycle_query(args) -> str:
+    if _CYCLE_TYPE not in ALLOWED_TYPES:
+        return _json({"ok": True, "note": "cycle tracking is not enabled on this server"})
+    status = cycle_status()
+    if not status:
+        return _json({"ok": True, "note": "no cycle data logged yet"})
+    periods = _cycle_periods(_load_cycle_history())
+    recent = periods[-12:]
+    starts = [p["start"] for p in periods]
+    lengths = {b.strftime("%Y-%m-%d"): (b - a).days for a, b in zip(starts, starts[1:])}
+    return _json({
+        "ok": True,
+        "current": status,
+        "recent_periods": [{"start": p["start"].strftime("%Y-%m-%d"),
+                            "end": p["end"].strftime("%Y-%m-%d"),
+                            "days": p["days"],
+                            "logged_days": p["logged_days"],
+                            "days_since_previous_start": lengths.get(p["start"].strftime("%Y-%m-%d"))}
+                           for p in recent],
+        "history_days_kept": _CYCLE_HISTORY_DAYS,
+        "note": ("derived from what was logged in the Health app - a skipped day "
+                 "shows up as a shorter period, not as a missing one"),
+    })
+
+
 # ------------------------------------------------------------
 # Compact snapshot (drives the health_now LLM/MCP tool)
 # ------------------------------------------------------------
@@ -776,8 +1051,10 @@ def _ago(age_min: Any) -> str:
 
 def health_now(hours: float = 6) -> Any:
     """Compact snapshot for an LLM: each metric = value + freshness, present only
-    when there is data. Heart rate, resting HR, HRV, respiratory rate; last night's
-    sleep (stages, period vitals, wrist temperature); and today's activity totals."""
+    when there is data. Heart rate, resting HR, HRV, respiratory rate, blood
+    oxygen; last night's sleep (stages, period vitals, wrist temperature);
+    today's activity totals; today's audio exposure; and where the menstrual
+    cycle stands."""
     h = health_summary(hours=hours)
     if not isinstance(h, dict):
         return "connected, waiting for first samples"
@@ -824,6 +1101,13 @@ def health_now(hours: float = 6) -> Any:
     rr = h.get("respiratory_rate")
     if isinstance(rr, dict) and rr.get("latest") is not None:
         out["respiratory_rate"] = f"{_n(rr['latest'])} breaths/min, {_ago(rr.get('age_min'))}"
+    spo2 = h.get("blood_oxygen_saturation")
+    if isinstance(spo2, dict) and spo2.get("latest") is not None:
+        line = f"{_n(spo2['latest'])}%, {_ago(spo2.get('age_min'))}"
+        low = (spo2.get("range") or {}).get("min")
+        if low is not None and low < float(spo2["latest"]):
+            line += f" (low {_n(low)}% in range)"
+        out["blood_oxygen_saturation"] = line
 
     def _h1(x):
         try:
@@ -882,6 +1166,43 @@ def health_now(hours: float = 6) -> Any:
             out["walking_running_distance"] = f"{round(float(dist['today_total']) * 1.609344, 1)} km"
         except (TypeError, ValueError):
             pass
+
+    for key in ("environmental_audio_exposure", "headphone_audio_exposure"):
+        m = h.get(key)
+        if not isinstance(m, dict) or m.get("today_max") is None:
+            continue
+        line = f"today max {m['today_max']} dB, avg {m.get('today_avg')} dB"
+        loud = m.get("today_loud_n") or 0
+        if loud:
+            line += f" ({loud} of {m.get('today_n')} samples at or above {int(_AUDIO_LOUD_DB)} dB)"
+        out[key] = line
+
+    if _CYCLE_TYPE in ALLOWED_TYPES:
+        try:
+            cyc = cycle_status()
+        except Exception:
+            logger.warning("health_now: cycle block failed", exc_info=True)
+            cyc = None
+        if cyc:
+            block: dict[str, Any] = {}
+            if cyc.get("state"):
+                block["status"] = cyc["state"]
+            if cyc.get("flow_today"):
+                block["flow_today"] = cyc["flow_today"]
+            if cyc.get("last_period_start"):
+                block["last_period_start"] = cyc["last_period_start"]
+            if cyc.get("predicted_next_start"):
+                _d = cyc["days_until_next"]
+                _when = (f"in {_d} days" if _d > 0 else
+                         "today" if _d == 0 else f"{-_d} days overdue")
+                block["predicted_next_start"] = (
+                    f"{cyc['predicted_next_start']} ({_when}, "
+                    f"est. from {cyc['based_on_cycles']} cycles of "
+                    f"~{cyc['avg_cycle_days']} days)")
+            elif cyc.get("note"):
+                block["note"] = cyc["note"]
+            if block:
+                out["menstrual_cycle"] = block
     return out or "connected, waiting for first samples"
 
 

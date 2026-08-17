@@ -29,8 +29,10 @@ mcp = FastMCP("health-collar")
 @mcp.tool()
 def health_now() -> dict:
     """A one-glance snapshot of the latest health metrics — each as value +
-    freshness. Covers heart rate, resting HR, HRV, respiratory rate, last night's
-    sleep (stages, period vitals, wrist temperature), and today's activity totals.
+    freshness. Covers heart rate, resting HR, HRV, respiratory rate, blood
+    oxygen, last night's sleep (stages, period vitals, wrist temperature),
+    today's activity totals, today's environmental and headphone audio
+    exposure, and where the menstrual cycle currently stands.
     Use this first; reach for health_detail only when you need to go deeper."""
     return hs.health_now()
 
@@ -43,11 +45,19 @@ async def health_detail(metric: str = "heart_rate",
     metric = heart_rate / heart_rate_variability / respiratory_rate:
         every sample plus min/max/avg over a window (capped at 2h). Pass ISO
         times as start / end; defaults to the last 2h.
+    metric = blood_oxygen_saturation (spo2) / environmental_audio_exposure
+    (noise) / headphone_audio_exposure:
+        same, but over a window capped at 24h — these are far sparser. The
+        audio ones also report how many samples reached 80 dB.
     metric = sleep:
         one night's stage-by-stage timeline, sleep-period vitals and wrist
         temperature. Pass date = YYYY-MM-DD; defaults to the latest night.
+    metric = cycle:
+        the logged periods, their lengths, the cycle lengths between them and
+        the current cycle day. Ignores start / end / date.
 
-    Raw samples are only kept for 48h."""
+    Raw samples are only kept for 48h; sleep and cycle keep their own longer
+    history."""
     args: dict = {"metric": metric}
     if start:
         args["from"] = start

@@ -19,7 +19,7 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>Collar 读取心率与睡眠,同步到你自己的服务器。</string>
+	<string>Collar 读取心率、睡眠、血氧、音量暴露与经期记录,同步到你自己的服务器。</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>Collar 在测量心率时需要记录体能训练会话数据。</string>
 	<key>WKApplication</key>

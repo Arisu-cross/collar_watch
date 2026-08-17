@@ -1,5 +1,30 @@
 # health collar
 
+## 2026-08-17 更新：血氧 / 环境音量 / 耳机音量 / 经期跟踪
+
+Watch 端新采集四类数据，服务端和 MCP 一并接上：
+
+| 指标 | 内部名称 | 说明 |
+|---|---|---|
+| 血氧 | `blood_oxygen_saturation` | 服务端本来就认这个名字，只是采集端一直没请求过。HealthKit 给的是 0–1 的比例，上报前乘 100 换成 `%`，与 HAE 对齐 |
+| 环境音量 | `environmental_audio_exposure` | dB(A)，手表麦克风按时段写的聚合样本 |
+| 耳机音量 | `headphone_audio_exposure` | dB(A)，戴 AirPods 等设备放音时才有 |
+| 经期 | `menstrual_flow` | 分类样本，一天一条。流量档位在 `value`，可读标签与「周期开始」在 `extra` |
+
+几个口径上的决定：
+
+- **音量不求和。** 每条样本自带的就是那个时段的平均分贝，加起来没有意义。服务端按「今日最大 / 样本均值 / 有几条到 80 dB」呈现（80 dB 是 Apple 自己的响度门槛）。注意样本均值是不加权的，不是严格的时长加权暴露量。
+- **经期有自己的长期文件。** 原始样本只留 48 小时，而周期长度要按月算，所以按天落进 `cycle_history.jsonl`（保留约 400 天），周期、周期长度、平均值都是从这个文件推出来的。
+- **经期条目改写要能覆盖。** 在健康 app 里把某天的流量改掉，HealthKit 给的还是同一天，原来的 `(type, at)` 幂等键会把改写当重复丢掉、历史永远停在旧值。所以 `menstrual_flow` 的幂等键额外带上 `value`。
+- **预测就是「上次开始 + 平均周期长度」**，不是医学模型，只有攒够两次周期才给，并且会标明是按几个周期算的。
+- **关掉经期功能**：把 `menstrual_flow` 从 `HEALTH_ALLOWED_TYPES` 里去掉即可，采集之外 `health_now` / `health_detail` 的经期视图也会一起关掉。
+
+`health_detail` 的窗口上限改成按指标区分：心率 / HRV / 呼吸仍是 2 小时；血氧和两个音量类样本稀疏得多，放宽到 24 小时（仍在 48 小时原始样本保留期内）。经期走 `metric=cycle`，返回记录到的历次周期。
+
+装机后健康授权会多弹一次读权限（血氧 / 音量 / 经期），权限描述文案也相应改了；`watch/project.yml` 与 `watch/Sources/Info.plist` 两处保持同句。**采集端有没有数据取决于机型和设置**：SE 系列没有血氧传感器，部分地区/系统版本血氧被关掉，关掉「环境音量测量」就没有环境音量，不戴耳机就没有耳机音量 —— 这些情况下对应指标一直空着是正常的。
+
+测试：`python tests/test_new_metrics.py`（只用标准库，也可以 `pytest`）。
+
 ## 2026-07-26 更新：按需实时心率测量
 
 之前的链路都是"手表定时上报、服务器被动收"。这次加了一条反方向的：**AI 侧可以主动调用一个 MCP 工具，手表当场开一段 30 秒的 workout session，测量当下的实时心率并送回来**。全程佩戴者只需要点开Iwatch上的app——app 打开后会自动拉起15s的通知进程，测完手腕轻震一下。
@@ -85,7 +110,8 @@ data/health/
 ├── latest.json                 # 每种指标当前最新值
 ├── samples-YYYYMMDD.jsonl      # 原始样本，按本地日拆分
 ├── wrist_baseline.json         # 腕温基线状态
-└── sleep_history.jsonl         # 睡眠按天汇总，保留约 30 天
+├── sleep_history.jsonl         # 睡眠按天汇总，保留约 30 天
+└── cycle_history.jsonl         # 经期按天记录，保留约 400 天
 ```
 
 当前整理逻辑包括：
@@ -93,6 +119,8 @@ data/health/
 - 按指标和时间做幂等去重；
 - 保存每种指标的最新样本；
 - 对步数、距离、活动能量、运动时间等累计指标生成“今日总量”；
+- 对环境音量 / 耳机音量生成“今日最大与均值”（这类指标不求和）；
+- 把经期记录按天存成长期历史，并归并成一次次周期（周期长度、经期天数、下次预估）；
 - 将最近睡眠阶段聚合成 core / deep / REM / awake 与时间轴；
 - 计算睡眠期间的心率、HRV、呼吸等摘要；
 - 保存最近睡眠历史，供 MCP 查询；
@@ -117,16 +145,16 @@ data/health/
 | 爬楼层数 | `flights_climbed` | count |
 | 活动能量 | `active_energy_burned` | kcal |
 | 运动时间 | `apple_exercise_time` | min |
+| 血氧 | `blood_oxygen_saturation` | % |
+| 环境音量 | `environmental_audio_exposure` | dBASPL |
+| 耳机音量 | `headphone_audio_exposure` | dBASPL |
+| 经期 | `menstrual_flow` | 分类(1–5)+ 标签 |
 
-可以根据需求另外添加数据种类——具体能不能得到某项数据仍取决于 Apple Watch 型号、地区、系统版本、HealthKit 权限以及设备是否实际产生了这类样本。
+可以根据需求另外添加数据种类——具体能不能得到某项数据仍取决于 Apple Watch 型号、地区、系统版本、HealthKit 权限以及设备是否实际产生了这类样本。血氧、音量、经期尤其如此，见上面 2026-08-17 那节的说明。
 
 ### 服务端额外兼容
 
-服务端 allow-list 里还包含：
-
-- `blood_oxygen_saturation`
-
-但**当前 `watch/` 采集端并没有请求或查询血氧类型**。如果使用 HAE 或其他采集端上报血氧，服务端可以接收；如果希望 CollarWatch 本身采集，需要另外在 `HealthCollector.swift` 中加入对应 HealthKit 类型，并考虑设备/地区可用性。
+服务端还认 Health Auto Export 的几个别名（例如 `menstruation` → `menstrual_flow`、`oxygen_saturation` → `blood_oxygen_saturation`），所以 HAE 或其他采集端上报的同类数据可以和 Watch 端合流。
 
 可以通过 `HEALTH_ALLOWED_TYPES` 覆盖服务端允许的指标集合。
 
@@ -239,18 +267,22 @@ pip install -r requirements.txt
 
 给 agent 的紧凑快照，适合先看“现在大概是什么状态”。目前会整理：
 
-- 最新心率、静息心率、HRV、呼吸；
+- 最新心率、静息心率、HRV、呼吸、血氧；
 - 最近一晚睡眠及阶段；
 - 睡眠期间的心率 / HRV / 呼吸摘要；
 - 腕温；
-- 今日步数、距离、活动能量、运动时间、爬楼层数。
+- 今日步数、距离、活动能量、运动时间、爬楼层数；
+- 今日环境音量 / 耳机音量的最大值与均值；
+- 当前经期状态（第几天、今日流量、上次开始、下次预估）。
 
 ### `health_detail`
 
 用于继续向下查：
 
 - 心率 / HRV / 呼吸：最近最多 2 小时的逐点样本和 min / max / avg；
-- 睡眠：指定日期的睡眠阶段时间轴、睡眠期 vitals 与最近 7 天平均睡眠时长。
+- 血氧 / 环境音量 / 耳机音量：同上，窗口放宽到 24 小时；音量另给「有几条到 80 dB」；
+- 睡眠：指定日期的睡眠阶段时间轴、睡眠期 vitals 与最近 7 天平均睡眠时长；
+- 经期（`metric=cycle`）：记录到的历次周期、各自天数、相邻两次的间隔与当前周期日。
 
 把 MCP 接给任何 agent，都意味着那个 agent 在调用工具时能够读取这些健康数据。请按你自己的信任边界配置 MCP 和服务器权限。
 
@@ -293,6 +325,12 @@ pip install -r requirements.txt
 
 目前步数、距离、活动能量等“今日总量”由服务器对收到的样本求和。对于单一 Watch 数据源这很直接；如果同时混入多个会产生重叠区间的 HealthKit 来源，仍可能出现重复累计。不要同时让多个采集链路长期上报同一批累计指标，除非你已经明确处理了来源优先级。
 
+### 经期只是「记了什么就有什么」
+
+周期是从健康 app 里手动记录的日期推出来的，没记的日子服务器无从知道。漏记会让某次经期显示得比实际短，甚至被拆成两次；下次开始时间只是「上次开始 + 最近几个周期的平均长度」，不是医学预测，也不做排卵期或受孕窗口推断。
+
+这类数据比其他指标都更敏感，而 MCP 意味着接上来的 agent 能读到它。不想让它进 MCP，就把 `menstrual_flow` 从 `HEALTH_ALLOWED_TYPES` 里去掉（一处生效，采集与展示一起关）。
+
 ### 原始数据默认不加密
 
 服务器落盘的是普通 JSON / JSONL。磁盘加密、备份策略、HTTPS、反向代理和访问控制都由部署环境负责。
@@ -316,6 +354,8 @@ health-collar/
 │   └── health_store.py          # 归一化、落盘、汇总、查询
 ├── mcp_server/
 │   └── server.py                # health_now / health_detail
+├── tests/
+│   └── test_new_metrics.py      # 血氧 / 音量 / 经期的数据层测试
 ├── watch/
 │   ├── Sources/                 # Watch app
 │   ├── Widget/                  # 表盘 complication
