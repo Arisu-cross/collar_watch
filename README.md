@@ -27,6 +27,36 @@ CollarWatch：HKWorkoutSession 30s 高频采样 → avg/min/max/样本数
 > ⚠️ **一个值得单独说的坑**：HealthKit 会在**运行时审查权限描述文案的质量**。`NSHealthUpdateUsageDescription` 写占位敷衍话（比如本项目旧版的"仅测试环境写入模拟数据。"）,请求写权限时会直接抛 `NSInvalidArgumentException` 闪退，报错原话是 `The string "..." is an invalid value for NSHealthUpdateUsageDescription`。这次加了 workout 写权限，并对此进行了相关修正。
 ---
 
+## 2026-08-18 更新：断流告警 + 三个新指标
+
+**断流告警（`server/stale_alert.py`）**。采集端停了——签名过期、手机关机、权限被撤、后台被系统掐——
+表现都是**静默停传**：读数据那一端只看到「没有新数据」，而不是「我看不到她了」，于是当作一切正常。
+这是整条链路最危险的失败方式，所以补了一个只读 `latest.json` 的检查器，不碰采集与存储逻辑。
+
+```bash
+python -m server.stale_alert --once    # 查一次，退出码 0 正常 / 1 断流
+python -m server.stale_alert --loop    # 常驻，按间隔自己查
+```
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `HEALTH_STALE_MINUTES` | 90 | 多久没数据算断流 |
+| `HEALTH_STALE_TYPES` | `heart_rate` | 盯哪些类型（逗号分隔） |
+| `HEALTH_ALERT_WEBHOOK` | 空 | 告警发到哪，POST JSON `{title, body}`；Bark 的 `https://api.day.app/<key>` 直接可用 |
+| `HEALTH_ALERT_COOLDOWN_MIN` | 180 | 同一次断流最多多久重复叫一次 |
+| `HEALTH_STALE_INTERVAL_MIN` | 15 | `--loop` 的检查间隔 |
+
+行为：**从没收到过数据也算断流**（刚上线时就该被叫一声，而不是静悄悄等着）；
+冷却期内不重复刷屏；**数据回来时会再通知一次**，免得你不知道什么时候恢复的。
+没配 webhook 就只打到 stdout，至少日志里留得下。
+
+**新增三个可收类型**：`environmental_audio_exposure`、`headphone_audio_exposure`、`menstrual_flow`。
+不想收就从 `ALLOWED_TYPES` 删掉，或用 `HEALTH_ALLOWED_TYPES` 覆盖整份名单。
+注意它们目前只是**存下来、可用 `health_detail` 查**；`health_now` 的快照字段是显式挑的，
+要让它们出现在快照里得另外加。
+
+---
+
 `health collar` 是一个面向个人使用的 Apple Health / Apple Watch 数据同步小工具。
 
 它的目标很单纯：让 Apple Watch 上已经写入 HealthKit 的数据，以尽可能短而稳定的延迟同步到你自己的服务器，整理成普通文件，并在需要时通过 MCP 提供给 AI agent 使用（提供summary status和details 两种查看方式）。
