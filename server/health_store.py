@@ -56,6 +56,10 @@ ALLOWED_TYPES: list[str] = [
     "step_count", "flights_climbed", "walking_running_distance",
     "active_energy_burned", "apple_exercise_time",
     "apple_sleeping_wrist_temperature",
+    # 听力与经期:iPhone 侧采集端会送这三种。不想收就从这里删掉,
+    # 或用 HEALTH_ALLOWED_TYPES 覆盖整份名单。
+    "environmental_audio_exposure", "headphone_audio_exposure",
+    "menstrual_flow",
 ]
 _env_allowed = os.environ.get("HEALTH_ALLOWED_TYPES", "").strip()
 if _env_allowed:
