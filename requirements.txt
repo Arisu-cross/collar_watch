@@ -1,3 +1,14 @@
 # The data layer (server/health_store.py) is pure standard library — no deps.
-# This is only needed to run the MCP server (mcp_server/server.py).
-mcp>=1.0
+#
+# These are needed to run the MCP server (mcp_server/server.py) and the HTTP
+# ingest shell (server/app.py). starlette and uvicorn already ship as mcp
+# dependencies; they are pinned here because app.py imports them directly.
+#
+# ⚠️ 钉死版本,别改回 `mcp>=1.0`(2026-08-21):mcp 2.0.0 已经移除了
+# `mcp.server.fastmcp`,而 mcp_server/server.py 正是从那里导入 FastMCP。
+# 用范围写法的话,**任何一次重新构建都会装上 2.x 并让服务开机即崩** ——
+# 现在这个镜像只是因为构建于 1.x 时期才活着。要升 2.x 得先改导入路径。
+# 这几个版本号是 2026-08-21 从线上容器 pip freeze 抄下来的,与在跑的一致。
+mcp==1.28.1
+starlette==1.3.1
+uvicorn==0.51.0
