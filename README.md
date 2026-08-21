@@ -2,6 +2,12 @@
 
 ## 2026-07-26 更新：按需实时心率测量
 
+> ℹ️ **这一节描述的功能仍在代码里，但可以被关掉**（2026-08-21 起）。
+> 把 `measure_heart_rate` 写进 `HEALTH_DISABLED_TOOLS`，它就不会出现在 agent 的工具表里。
+> 什么时候该关：**手表 app / 快捷指令那一头已经撤掉的时候**。
+> 那种情况下工具本身不会消失，agent 会一直下指令、一直等到 `pending` 再到 `expired`，
+> 而它那头读到的是「测不到」——听起来就像「我看不见你的健康数据」。
+
 之前的链路都是"手表定时上报、服务器被动收"。这次加了一条反方向的：**AI 侧可以主动调用一个 MCP 工具，手表当场开一段 30 秒的 workout session，测量当下的实时心率并送回来**。全程佩戴者只需要点开Iwatch上的app——app 打开后会自动拉起15s的通知进程，测完手腕轻震一下。
 
 ```text
@@ -333,7 +339,18 @@ pip install -r requirements.txt
 | `HEALTH_DATA_DIR` | `./data/health` | 健康数据文件目录 |
 | `HEALTH_TZ_OFFSET_HOURS` | `0` | 固定 UTC 偏移，用于“今天”和展示时间 |
 | `HEALTH_ALLOWED_TYPES` | 内置列表 | 逗号分隔的指标 allow-list |
-| `HEALTH_INGEST_TOKEN` | 无 | 约定给你自己的 HTTP ingest 层使用；核心数据层不会自动校验 |
+| `HEALTH_INGEST_TOKEN` | 无 | **设备侧** token（手表 / HAE）。`server/app.py` 用它守 `/api/health`、`/command`、`/command/result`、`/debug`；认 `X-Health-Token` 头或 `?token=`。核心数据层自己不校验 |
+| `COLLAR_MCP_TOKEN` | 无 | **agent 侧** token，守 `/mcp`（`Authorization: Bearer` 或 `X-Token`）。**和上面那把是两把，别设成同一个值** |
+| `COLLAR_ALLOW_NO_AUTH` | 无 | `=1` 时跳过上面两道校验。本地裸跑用，别在公网开 |
+| `COLLAR_ALLOWED_HOSTS` | 空 | MCP SDK 的 DNS-rebinding 白名单，逗号分隔（`:*` 通配端口）。留空=关掉该防护 |
+| `HEALTH_TYPE_ALIASES` | 空 | 入库前的类型改名，`from:to` 逗号分隔，追加在内置表之后 |
+| `HEALTH_DISABLED_TOOLS` | 空 | 逗号分隔的工具名，被点名的不注册（见上文「工具开关」） |
+| `HEALTH_MEASURE_DURATION_S` | `30` | 按需实时测量的秒数 |
+| `HEALTH_COMMAND_TTL_MIN` | `30` | 指令有效期 |
+| `PORT` | `8080` | `server/app.py` 监听端口 |
+
+> ⚠️ 两把 token 都没设时,对应的口一律 401；而**缺头和错头返回的是同一句 `bad token`**，
+> 分不出「忘了带」还是「带错了」。排查 401 时先确认变量设没设，别一头扎进猜头名。
 
 `HEALTH_TZ_OFFSET_HOURS` 是固定偏移，不是 IANA timezone。处于夏令时地区时需要自行调整，否则跨 DST 时“今天”和睡眠日期的边界可能偏一小时。
 
