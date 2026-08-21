@@ -44,26 +44,29 @@ _STATUS_EXCLUDED_SOURCES = {"filter_test", "drill"}
 # their current calendar-day sum as an additive field.
 _CUMULATIVE_TYPES = {
     "step_count", "flights_climbed", "walking_running_distance",
-    "active_energy_burned", "apple_exercise_time",
+    "active_energy_burned", "apple_exercise_time", "time_in_daylight",
 }
 _HRV_STATUS_MAX_AGE_MIN = 24 * 60
 
 # Type allow-list: the metrics worth keeping. Override with HEALTH_ALLOWED_TYPES.
 #
 # ⚠️ 这份名单只是「口径」,不是「闸门」—— normalize_payload / store_samples 都不看它,
-# 直接调 store_samples 什么类型都会落盘。真正在入口挡掉非名单类型的是 HTTP ingest 壳
-# (本仓库不含,自备),它 import 这个常量再自己过滤;health_summary 用它挑显示字段,
-# execute_health_detail 用它决定认哪些 metric。改这份名单会同时动到这三处。
+# 直接调 store_samples 什么类型都会落盘。真正在入口挡掉非名单类型的是 server/app.py
+# 的 ingest 路由(`keep = [s for s in samples if s["type"] in allowed]`);
+# health_summary 用它挑显示字段,execute_health_detail 用它决定认哪些 metric。
+# 改这份名单会同时动到这三处。
 ALLOWED_TYPES: list[str] = [
     "heart_rate", "heart_rate_variability", "resting_heart_rate",
     "sleep_analysis", "respiratory_rate", "blood_oxygen_saturation",
     "step_count", "flights_climbed", "walking_running_distance",
     "active_energy_burned", "apple_exercise_time",
     "apple_sleeping_wrist_temperature",
-    # 听力:iPhone 侧采集端会送这两种。不想收就从这里删掉,
-    # 或用 HEALTH_ALLOWED_TYPES 覆盖整份名单。
-    "environmental_audio_exposure", "headphone_audio_exposure",
-    # menstrual_flow(经期流量)按机主要求不收 —— 别再加回来。
+    # Context, not vitals: did they get outside today, and how loud is it there.
+    "time_in_daylight", "environmental_audio_exposure",
+    # 耳机音量暴露(iPhone 侧送来)。2026-08-21 补收 —— 此前一直在门口被丢,
+    # 线上计数已丢掉 1239 条;历史找不回来,从补收那天开始攒。
+    "headphone_audio_exposure",
+    # menstrual_flow(经期流量)按机主要求**不收** —— 别再加回来。
 ]
 _env_allowed = os.environ.get("HEALTH_ALLOWED_TYPES", "").strip()
 if _env_allowed:
@@ -388,6 +391,32 @@ def _sample_points(rows: list[dict[str, Any]], max_points: int) -> list[dict[str
     return points
 
 
+def _as_kcal(value: Any, unit: Any) -> Optional[float]:
+    """Energy to kcal. Health Auto Export reports kJ, the watch app kcal."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    u = str(unit or "").strip().lower()
+    if u in ("kj", "kilojoule", "kilojoules"):
+        return v / 4.184
+    return v
+
+
+def _as_km(value: Any, unit: Any) -> Optional[float]:
+    """Distance to km. Health Auto Export reports km, the watch app miles."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    u = str(unit or "").strip().lower()
+    if u in ("mi", "mile", "miles"):
+        return v * 1.609344
+    if u in ("m", "meter", "meters"):
+        return v / 1000.0
+    return v
+
+
 def _rounded_total(stype: str, values: list[float]) -> Optional[float | int]:
     if not values:
         return None
@@ -686,10 +715,10 @@ def sleep_7day_avg():
 # Detail query (drives the health_detail LLM/MCP tool; see mcp/ later)
 # ------------------------------------------------------------
 
-# 高频类型:手表每几分钟就落一个点,两小时的窗口已经够密。其余类型
-# (血氧、日照、听力暴露)一天才寥寥几条,用两小时去查基本必然空手 ——
-# 那正是「明明收着、他却说看不见」的来源。原始样本本就只留 48h,
-# 所以低频类型放宽到默认 24h、上限 48h,不会多读到任何已经不存在的东西。
+# 高频类型:手表每几分钟就落一个点,两小时的窗口已经够密。其余类型(血氧、
+# 日照、听力暴露)一天才寥寥几条,用两小时去查基本必然空手 —— 那正是
+# 「明明收着、他却说看不见」的来源。原始样本本就只留 48h,所以低频类型放宽到
+# 默认 24h、上限 48h,不会多读到任何已经不存在的东西。
 _HIGH_FREQ_TYPES = {"heart_rate", "heart_rate_variability", "respiratory_rate"}
 
 
@@ -707,8 +736,8 @@ async def execute_health_detail(arguments=None) -> str:
     metric = alias.get(metric, metric)
     if metric == "sleep_analysis":
         return _health_sleep_query(args)
-    # 认哪些指标,跟着 ALLOWED_TYPES 走 —— 收进来的就查得到。以前这里写死了
-    # 三个,于是血氧/日照/听力收了却读不出来,加类型的人也不会想到要改两处。
+    # 认哪些指标跟着 ALLOWED_TYPES 走 —— 收得进来的就查得到。以前这里写死了三个,
+    # 于是血氧收了 429 条却一条都读不出来,而且不报错、只是「查不到」。
     known = set(ALLOWED_TYPES) - {"sleep_analysis"}
     if metric not in known:
         return _json({"ok": False, "error": f"unknown metric '{metric}'; "
@@ -897,17 +926,40 @@ def health_now(hours: float = 6) -> Any:
         except (TypeError, ValueError):
             return x
 
-    for key, unit in [("step_count", ""), ("active_energy_burned", " kcal"),
-                      ("apple_exercise_time", " min"), ("flights_climbed", "")]:
+    for key, unit in [("step_count", ""), ("apple_exercise_time", " min"),
+                      ("flights_climbed", "")]:
         m = h.get(key)
         if isinstance(m, dict) and m.get("today_total") is not None:
             out[key] = f"{_int(m['today_total'])}{unit}"
+
+    # Energy and distance are reported in different units by different sources —
+    # the watch app sends kcal and miles, Health Auto Export sends kJ and km.
+    # Convert from whatever actually arrived rather than assuming one of them,
+    # otherwise the figure is silently wrong by a constant factor.
+    energy = h.get("active_energy_burned")
+    if isinstance(energy, dict) and energy.get("today_total") is not None:
+        kcal = _as_kcal(energy["today_total"], energy.get("unit"))
+        if kcal is not None:
+            out["active_energy_burned"] = f"{_int(kcal)} kcal"
     dist = h.get("walking_running_distance")
     if isinstance(dist, dict) and dist.get("today_total") is not None:
-        try:
-            out["walking_running_distance"] = f"{round(float(dist['today_total']) * 1.609344, 1)} km"
-        except (TypeError, ValueError):
-            pass
+        km = _as_km(dist["today_total"], dist.get("unit"))
+        if km is not None:
+            out["walking_running_distance"] = f"{round(km, 1)} km"
+
+    # Context rather than vitals: whether they got outside today, and how loud
+    # it is around them. Daylight is a daily total; noise is a level, so the
+    # latest reading is what matters.
+    daylight = h.get("time_in_daylight")
+    if isinstance(daylight, dict) and daylight.get("today_total") is not None:
+        mins = _n(daylight["today_total"])
+        if mins is not None:
+            out["time_in_daylight"] = (f"{mins // 60} hr {mins % 60} min"
+                                       if mins >= 60 else f"{mins} min")
+    noise = h.get("environmental_audio_exposure")
+    if isinstance(noise, dict) and noise.get("latest") is not None:
+        out["environmental_audio_exposure"] = (
+            f"{_n(noise['latest'])} dB, {_ago(noise.get('age_min'))}")
     return out or "connected, waiting for first samples"
 
 
