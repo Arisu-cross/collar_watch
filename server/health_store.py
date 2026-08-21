@@ -48,18 +48,22 @@ _CUMULATIVE_TYPES = {
 }
 _HRV_STATUS_MAX_AGE_MIN = 24 * 60
 
-# Type allow-list: only ingest the metrics that matter; anything else is dropped
-# at the door. Override with the HEALTH_ALLOWED_TYPES env var if you need more.
+# Type allow-list: the metrics worth keeping. Override with HEALTH_ALLOWED_TYPES.
+#
+# ⚠️ 这份名单只是「口径」,不是「闸门」—— normalize_payload / store_samples 都不看它,
+# 直接调 store_samples 什么类型都会落盘。真正在入口挡掉非名单类型的是 HTTP ingest 壳
+# (本仓库不含,自备),它 import 这个常量再自己过滤;health_summary 用它挑显示字段,
+# execute_health_detail 用它决定认哪些 metric。改这份名单会同时动到这三处。
 ALLOWED_TYPES: list[str] = [
     "heart_rate", "heart_rate_variability", "resting_heart_rate",
     "sleep_analysis", "respiratory_rate", "blood_oxygen_saturation",
     "step_count", "flights_climbed", "walking_running_distance",
     "active_energy_burned", "apple_exercise_time",
     "apple_sleeping_wrist_temperature",
-    # 听力与经期:iPhone 侧采集端会送这三种。不想收就从这里删掉,
+    # 听力:iPhone 侧采集端会送这两种。不想收就从这里删掉,
     # 或用 HEALTH_ALLOWED_TYPES 覆盖整份名单。
     "environmental_audio_exposure", "headphone_audio_exposure",
-    "menstrual_flow",
+    # menstrual_flow(经期流量)按机主要求不收 —— 别再加回来。
 ]
 _env_allowed = os.environ.get("HEALTH_ALLOWED_TYPES", "").strip()
 if _env_allowed:
@@ -682,30 +686,48 @@ def sleep_7day_avg():
 # Detail query (drives the health_detail LLM/MCP tool; see mcp/ later)
 # ------------------------------------------------------------
 
+# 高频类型:手表每几分钟就落一个点,两小时的窗口已经够密。其余类型
+# (血氧、日照、听力暴露)一天才寥寥几条,用两小时去查基本必然空手 ——
+# 那正是「明明收着、他却说看不见」的来源。原始样本本就只留 48h,
+# 所以低频类型放宽到默认 24h、上限 48h,不会多读到任何已经不存在的东西。
+_HIGH_FREQ_TYPES = {"heart_rate", "heart_rate_variability", "respiratory_rate"}
+
+
 async def execute_health_detail(arguments=None) -> str:
-    """health_detail tool: for heart_rate / HRV / respiratory, sample + min/max/avg
-    over a window (<=2h). For sleep, query a night's stage timeline + period vitals
-    + wrist temperature. Raw samples are kept only 48h."""
+    """health_detail tool: for any ingested metric, every sample plus min/max/avg
+    over a window. High-frequency metrics (HR / HRV / respiratory) default to the
+    last 2h; everything else to the last 24h (capped at 48h, the raw retention).
+    For sleep, query a night's stage timeline + period vitals + wrist temperature."""
     args = arguments or {}
     metric = str(args.get("metric") or "heart_rate").strip().lower()
     alias = {"hr": "heart_rate", "hrv": "heart_rate_variability", "sleep": "sleep_analysis",
-             "respiratory": "respiratory_rate", "breath": "respiratory_rate", "resp": "respiratory_rate"}
+             "respiratory": "respiratory_rate", "breath": "respiratory_rate", "resp": "respiratory_rate",
+             "spo2": "blood_oxygen_saturation", "oxygen": "blood_oxygen_saturation",
+             "daylight": "time_in_daylight", "steps": "step_count"}
     metric = alias.get(metric, metric)
     if metric == "sleep_analysis":
         return _health_sleep_query(args)
-    if metric not in {"heart_rate", "heart_rate_variability", "respiratory_rate"}:
-        return _json({"ok": False, "error": f"unknown metric '{metric}'; use heart_rate / heart_rate_variability / respiratory_rate / sleep"})
+    # 认哪些指标,跟着 ALLOWED_TYPES 走 —— 收进来的就查得到。以前这里写死了
+    # 三个,于是血氧/日照/听力收了却读不出来,加类型的人也不会想到要改两处。
+    known = set(ALLOWED_TYPES) - {"sleep_analysis"}
+    if metric not in known:
+        return _json({"ok": False, "error": f"unknown metric '{metric}'; "
+                                            f"use one of: {', '.join(sorted(known))} / sleep"})
     now = _now()
+    default_h, cap_h = (2, 2) if metric in _HIGH_FREQ_TYPES else (24, 48)
     end = _parse_range_dt(args.get("to")) or now
-    start = _parse_range_dt(args.get("from")) or (end - timedelta(hours=2))
-    if end - start > timedelta(hours=2):
-        start = end - timedelta(hours=2)
+    start = _parse_range_dt(args.get("from")) or (end - timedelta(hours=default_h))
+    if end - start > timedelta(hours=cap_h):
+        start = end - timedelta(hours=cap_h)
     rows = _samples_between(start, end, types={metric}, exclude_sources=_STATUS_EXCLUDED_SOURCES)
     vals = [float(r["value"]) for r in rows if r.get("value") is not None]
-    pts = [{"time": _parse_dt(r["at"]).astimezone(_TZ).strftime("%H:%M"), "value": round(float(r["value"]), 1)}
+    # 低频类型跨天,只给 HH:MM 会把昨天和今天混成一团,所以带上日期。
+    _fmt = "%H:%M" if metric in _HIGH_FREQ_TYPES else "%m-%d %H:%M"
+    pts = [{"time": _parse_dt(r["at"]).astimezone(_TZ).strftime(_fmt), "value": round(float(r["value"]), 1)}
            for r in rows if r.get("value") is not None]
-    return _json({"ok": True, "metric": metric,
-                  "window": start.astimezone(_TZ).strftime("%H:%M") + " -> " + end.astimezone(_TZ).strftime("%H:%M"),
+    unit = next((r.get("unit") for r in rows if r.get("unit")), None)
+    return _json({"ok": True, "metric": metric, "unit": unit,
+                  "window": start.astimezone(_TZ).strftime("%m-%d %H:%M") + " -> " + end.astimezone(_TZ).strftime("%m-%d %H:%M"),
                   "sample_count": len(vals), "min": round(min(vals), 1) if vals else None,
                   "max": round(max(vals), 1) if vals else None,
                   "avg": round(sum(vals) / len(vals), 1) if vals else None, "samples": pts})

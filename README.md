@@ -50,10 +50,18 @@ python -m server.stale_alert --loop    # 常驻，按间隔自己查
 冷却期内不重复刷屏；**数据回来时会再通知一次**，免得你不知道什么时候恢复的。
 没配 webhook 就只打到 stdout，至少日志里留得下。
 
-**新增三个可收类型**：`environmental_audio_exposure`、`headphone_audio_exposure`、`menstrual_flow`。
+**新增两个可收类型**：`environmental_audio_exposure`、`headphone_audio_exposure`。
 不想收就从 `ALLOWED_TYPES` 删掉，或用 `HEALTH_ALLOWED_TYPES` 覆盖整份名单。
-注意它们目前只是**存下来、可用 `health_detail` 查**；`health_now` 的快照字段是显式挑的，
-要让它们出现在快照里得另外加。
+（本来还有 `menstrual_flow`，2026-08-21 按机主要求撤掉，不收。）
+
+> ⚠️ **勘误（2026-08-21）**：这里原先写着「它们只是存下来、**可用 `health_detail` 查**」——
+> **这句是错的**。当时的 `execute_health_detail` 把认得的 metric 写死成了心率/HRV/呼吸率/睡眠
+> 四个，其余一律回 `unknown metric`。也就是说 8-18 那次只加了「收」、没加「读」，
+> 收进来的东西**只写不读**：线上攒了 429 条血氧、836 条环境音，AI 侧一条都够不着，
+> 而且失败得毫无声响——它不报错，只是「查不到」。
+> 现已修好：`health_detail` 改为放行 `ALLOWED_TYPES` 里的任意类型。
+> `health_now` 的快照字段仍然是显式挑的（那是每次调用都要进上下文的东西，刻意保持短），
+> 要让某个指标出现在快照里，仍得单独加。
 
 ---
 
@@ -277,10 +285,15 @@ pip install -r requirements.txt
 
 ### `health_detail`
 
-用于继续向下查：
+用于继续向下查。认的 metric 跟着 `ALLOWED_TYPES` 走——**收得进来的就查得到**：
 
-- 心率 / HRV / 呼吸：最近最多 2 小时的逐点样本和 min / max / avg；
+- 心率 / HRV / 呼吸（高频，手表每几分钟一个点）：默认最近 2 小时，上限 2 小时；
+- 其余指标（血氧、日照时长、听力暴露、步数、活动能量等，一天才寥寥几条）：
+  默认最近 24 小时，上限 48 小时——原始样本本就只留 48 小时；
 - 睡眠：指定日期的睡眠阶段时间轴、睡眠期 vitals 与最近 7 天平均睡眠时长。
+
+低频指标用 2 小时的窗口去查基本必然空手，这正是「明明收着、AI 却说看不见」的来源，
+所以两类分开定窗。返回里带 `unit`，低频指标的时间戳带日期（跨天时不至于混成一团）。
 
 把 MCP 接给任何 agent，都意味着那个 agent 在调用工具时能够读取这些健康数据。请按你自己的信任边界配置 MCP 和服务器权限。
 

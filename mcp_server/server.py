@@ -43,6 +43,12 @@ async def health_detail(metric: str = "heart_rate",
     metric = heart_rate / heart_rate_variability / respiratory_rate:
         every sample plus min/max/avg over a window (capped at 2h). Pass ISO
         times as start / end; defaults to the last 2h.
+    metric = blood_oxygen_saturation / time_in_daylight / step_count /
+             active_energy_burned / flights_climbed / walking_running_distance /
+             apple_exercise_time / resting_heart_rate /
+             environmental_audio_exposure / headphone_audio_exposure:
+        same, but these are logged only a few times a day, so the window
+        defaults to the last 24h (capped at 48h).
     metric = sleep:
         one night's stage-by-stage timeline, sleep-period vitals and wrist
         temperature. Pass date = YYYY-MM-DD; defaults to the latest night.
