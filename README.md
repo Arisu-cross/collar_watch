@@ -13,7 +13,8 @@ MCP tool (measure_heart_rate)
 CollarWatch：HKWorkoutSession 30s 高频采样 → avg/min/max/样本数
 ```
 
-**ingest 侧要挂的两个新口**（数据层函数已在 `health_store.py`，HTTP 壳照旧自备）：
+**ingest 侧要挂的两个新口**（数据层函数在 `health_store.py`；HTTP 壳原先「自备」，
+自 2026-08-21 起就是仓库里的 `server/app.py`，这两个口它已经挂好了）：
 
 - `GET /command` → 执行体 `fetch_pending_command()`。有指令返回 `{"command": "measure_heart_rate", "command_id": "...", "duration_seconds": 30, ...}`，没有返回 `{"command": null}`
 - `POST /command/result` ← 手表送来 `{"command_id": "...", "result": {"heart_rate_average": 83, ...}}`，执行体 `complete_command()`
@@ -62,6 +63,34 @@ python -m server.stale_alert --loop    # 常驻，按间隔自己查
 > 现已修好：`health_detail` 改为放行 `ALLOWED_TYPES` 里的任意类型。
 > `health_now` 的快照字段仍然是显式挑的（那是每次调用都要进上下文的东西，刻意保持短），
 > 要让某个指标出现在快照里，仍得单独加。
+
+---
+
+## 2026-08-21 更新：HTTP 壳进仓库 + 读口放开 + 工具开关
+
+**`server/app.py` 现在在仓库里了。** 在此之前它只存在于部署好的容器中——README 一直写着
+「HTTP 壳照旧自备」，于是那个唯一的正本躺在一个随时可能被重建的容器里。
+本次排查时发现：**容器里改文件是留不住的，重启即用镜像重建、改动全部还原**，
+要改这个服务只能重新部署；而部署包里没有 `app.py` 就等于把服务删掉。所以它必须进仓库。
+
+一起进来的还有 `main.py`（入口 shim）和钉死版本的 `requirements.txt`：
+
+> ⚠️ **`mcp>=1.0` 是个哑雷**。mcp 2.0.0 已经移除 `mcp.server.fastmcp`，
+> 而 `mcp_server/server.py` 正是从那里导入 `FastMCP`。用范围写法的话，
+> **任何一次重新构建都会装上 2.x、服务开机即崩**——现在跑着的实例只是因为
+> 镜像构建于 1.x 时期才活着。已钉死为 `mcp==1.28.1`。
+
+> ⚠️ **入口检测**。这个服务最初以 `docker` 计划部署，镜像自带 CMD。不带 Dockerfile
+> 重新部署时 Zeabur 会改判为 `python` 计划，而该计划启动的是 `python main.py`——
+> 于是构建成功、容器起来、然后死在 `can't open file '/app/main.py'`。
+> `main.py` 就是为此存在的：把入口给它，而不是去跟计划检测较劲。
+
+**`health_detail` 放开了**：认的 metric 跟着 `ALLOWED_TYPES` 走，收得进来的就查得到。
+此前它写死了心率/HRV/呼吸率/睡眠四个，导致血氧收了几百条却一条都读不出来（详见下方勘误）。
+
+**新增 `HEALTH_DISABLED_TOOLS`**：逗号分隔的工具名，被点名的工具不注册。
+用于「采集端已经撤掉、但工具还挂在 agent 手上」的情况——那种工具不会自己消失，
+agent 会一直伸手、一直拿到软失败，而软失败读起来像「我看不见你的数据」。
 
 ---
 
