@@ -59,7 +59,11 @@ python -m server.stale_alert --loop    # 常驻，按间隔自己查
 
 **新增两个可收类型**：`environmental_audio_exposure`、`headphone_audio_exposure`。
 不想收就从 `ALLOWED_TYPES` 删掉，或用 `HEALTH_ALLOWED_TYPES` 覆盖整份名单。
-（本来还有 `menstrual_flow`，2026-08-21 按机主要求撤掉，不收。）
+**`menstrual_flow`（经期流量）：2026-09-05 起收**。它 2026-08-21 曾按机主要求撤掉，
+当天的注释写着「别再加回来」——**2026-09-05 机主改主意，明确要求收**（要 agent 看得见，
+并且主动关心）。以最新一次指示为准，别照旧注释再撤一次。
+量级实测过：这类数据 HealthKit 一天通常只记一次，去重键是「类型＋时间戳」，
+重复推送不重复存，**每天多约 1 行、100 字节左右**。
 
 > ⚠️ **勘误（2026-08-21）**：这里原先写着「它们只是存下来、**可用 `health_detail` 查**」——
 > **这句是错的**。当时的 `execute_health_detail` 把认得的 metric 写死成了心率/HRV/呼吸率/睡眠

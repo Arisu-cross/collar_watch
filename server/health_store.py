@@ -66,7 +66,10 @@ ALLOWED_TYPES: list[str] = [
     # 耳机音量暴露(iPhone 侧送来)。2026-08-21 补收 —— 此前一直在门口被丢,
     # 线上计数已丢掉 1239 条;历史找不回来,从补收那天开始攒。
     "headphone_audio_exposure",
-    # menstrual_flow(经期流量)按机主要求**不收** —— 别再加回来。
+    # 经期流量。2026-08-21 曾按机主要求撤掉(那时的注释写着「别再加回来」),
+    # **2026-09-05 机主改主意,明确要求收**:她要 agent 看得见,而且要他主动关心。
+    # 改口径请以最新一次机主指示为准,别照着旧注释又撤一次。
+    "menstrual_flow",
 ]
 _env_allowed = os.environ.get("HEALTH_ALLOWED_TYPES", "").strip()
 if _env_allowed:
