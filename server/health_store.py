@@ -832,6 +832,20 @@ def _ago(age_min: Any) -> str:
     return f"{m // 1440} days ago"
 
 
+# HealthKit 的经期流量是**分级**,不是数量:1 未标 / 2 少 / 3 中 / 4 多 / 5 无(已结束)。
+# 直接把裸数字递给 agent 他只能猜,而且容易猜反(5 是「没有」,不是「最多」)。
+# 认不出来的值原样带出去,别硬套一个词 —— 宁可他看见 "flow=7" 去问她,
+# 也不要他看见一个编出来的「大量」。
+_FLOW_WORDS = {1: "有记录(未标流量)", 2: "少量", 3: "中量", 4: "大量", 5: "无(已结束)"}
+
+
+def _flow_word(v: Any) -> str:
+    try:
+        return _FLOW_WORDS[int(round(float(v)))]
+    except (TypeError, ValueError, KeyError):
+        return f"flow={v}"
+
+
 def health_now(hours: float = 6) -> Any:
     """Compact snapshot for an LLM: each metric = value + freshness, present only
     when there is data. Heart rate, resting HR, HRV, respiratory rate; last night's
@@ -882,6 +896,16 @@ def health_now(hours: float = 6) -> Any:
     rr = h.get("respiratory_rate")
     if isinstance(rr, dict) and rr.get("latest") is not None:
         out["respiratory_rate"] = f"{_n(rr['latest'])} breaths/min, {_ago(rr.get('age_min'))}"
+
+    # 经期(2026-09-05 机主要求:要看得见,而且要主动关心)。
+    # 放在 health_now 而不是只留给 health_detail —— 只有进了这份一眼快照,
+    # 它才是「他知道」,否则等于要他先想到去查,那就不叫看得见了。
+    # 数据源是 latest.json,不受原始样本 48h 清理的影响:这类一个月才记几次,
+    # 只看 48h 窗口的话大部分日子都是空的。所以这里必然带 age —— 一条
+    # 「中量,5 days ago」和「中量,just now」意思完全不同,别让他只读到前半句。
+    mf = h.get("menstrual_flow")
+    if isinstance(mf, dict) and mf.get("latest") is not None:
+        out["menstrual_flow"] = f"{_flow_word(mf['latest'])}, {_ago(mf.get('age_min'))}"
 
     def _h1(x):
         try:
